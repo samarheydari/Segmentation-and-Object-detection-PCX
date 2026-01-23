@@ -11,16 +11,20 @@ import matplotlib.pyplot as plt
 import copy
 import logging
 from contextlib import contextmanager
+from functools import partial
 
 from LCRP.models import get_model
 from src.plot_crp_explanations import plot_one_image_explanation, fig_to_array
 from src.plot_pcx_explanations_YOLO import plot_one_image_pcx_explanation
 from src.plotpcx_gpu import plot_pcx_explanations_pidnet
 from src.datasets.person_car_dataset import PersonCarDataset
-from datasets.flood_dataset import FloodDataset
+from src.datasets.flood_dataset import FloodDataset
 from src.entities import get_person_vehicle_detection_explanation_entity, get_flood_segmentation_explanation_entity
 from src.minio_client import FHHI_MINIO_BUCKET
 from src.memory_logging import log_cuda_memory
+from src.letterbox_utils import letterbox_transform, rescale_boxes, check_img_size
+from yolov6.data.data_augment import letterbox
+
 
 
 def _empty_cuda_cache():
@@ -47,6 +51,7 @@ class Explanator:
         # Lazy loading approach - don't load models until needed
         self._person_vehicle_model = None
         self._person_car_dataset = None
+        self._person_car_dataset_orig = None
         self._flood_model = None
         self._flood_dataset = None
 
@@ -264,21 +269,30 @@ class Explanator:
             self._person_car_dataset = self.load_person_car_data()
         return self._person_car_dataset
 
+    @property
+    def person_car_dataset_orig(self):
+        """Dataset without transform for accessing original high-res images."""
+        if not hasattr(self, '_person_car_dataset_orig') or self._person_car_dataset_orig is None:
+            person_car_data_path = os.path.join(self.project_root, "data", "person_car_detection_data", "original_BRK")
+            self._person_car_dataset_orig = PersonCarDataset(
+                root_dir=person_car_data_path,
+                split="train",
+                transform=None  # No transform - returns original images
+            )
+        return self._person_car_dataset_orig
+
     def load_person_vehicle_model(self):
         # Load the person/vehicle detection model
         model_name = "yolov6s6"
-        person_vehicle_model_path = os.path.join(self.project_root, "models", "yolo_person_car_detection_ckpt.pt")
-        return get_model(model_name=model_name, classes=2, ckpt_path=person_vehicle_model_path, device=self.device,
-                         dtype=self.dtype)
+        person_vehicle_model_path = os.path.join(self.project_root, "models", "best_ckpt_original.pt")
+        model = get_model(model_name=model_name, classes=2, ckpt_path=person_vehicle_model_path, device=self.device,
+                          dtype=self.dtype)
+        model.eval()
+        return model
 
     def load_person_car_data(self):
-        transform = transforms.Compose([
-            transforms.ToTensor(),  # Convert to tensor
-            transforms.Resize((640, 640)),
-            transforms.Lambda(lambda x: x.to(self.dtype)),
-        ])
-
-        person_car_data_path = os.path.join(self.project_root, "data", "person_car_detection_data", "Arthal")
+        transform = partial(letterbox_transform, target_size=640, stride=64, half=False, auto=False)
+        person_car_data_path = os.path.join(self.project_root, "data", "person_car_detection_data", "original_BRK")
         dataset = PersonCarDataset(root_dir=person_car_data_path, split="train", transform=transform)
         return dataset
     def explain_person_vehicle_detection(self, original_image_bucket: str, original_image_filename: str,
@@ -296,35 +310,43 @@ class Explanator:
         # layer = "module.backbone.ERBlock_6.2.cspsppf.cv7.block.conv"
         # This one suggested by Jawher for PCX
         layer = 'module.backbone.ERBlock_3.0.rbr_dense.conv'
-        prototype_dict = {0: 4, 1: 5}
+        prototype_dict = {0: 3, 1: 4}
 
         mode = "relevance"
 
         crp_output_dir = "output/crp/yolo_person_car"
         pcx_output_dir = "output/pcx/yolo_person_car"
-        ref_imgs_path = "output/ref_imgs_12"
+        ref_imgs_path = "output/ref_imgs/ref_imgs_12"
 
-        # Apply transform
+        # Get original image shape (H, W)
+        original_shape = image.shape[:2]
+
         log_cuda_memory(self.logger, "BEFORE IMAGE TRANSFORM")
-        image_tensor = self.person_car_dataset.transform(image)
-        log_cuda_memory(self.logger, "AFTER IMAGE TRANSFORM")
 
-        # We need to run the model to get the predicted boxes
-        test_img = self.person_car_dataset.transform(image)
-        test_img = test_img.unsqueeze(0)
+        img_size = check_img_size(640, stride=64)
+        img_letterbox = letterbox(image, new_shape=img_size, stride=64, auto=True)[0]
+        letterbox_shape = img_letterbox.shape[:2]
 
-        test_img = test_img.to(self.device)
+        # Convert to tensor
+        img_letterbox_transposed = img_letterbox.transpose((2, 0, 1))
+        img_tensor = torch.from_numpy(np.ascontiguousarray(img_letterbox_transposed))
+        image_tensor = img_tensor.float()
+        image_tensor /= 255.0
+
+        # Get ACTUAL letterbox shape from tensor (C, H, W) -> (H, W)
+        letterbox_shape = (image_tensor.shape[1], image_tensor.shape[2])
+
+        test_img = image_tensor.unsqueeze(0).to(self.device)
 
         with self.record_forward_time():
             scores, boxes = self.person_vehicle_model.predict_with_boxes(test_img)
         num_boxes = boxes.shape[1]
         self.logger.debug(f"Number of boxes: {num_boxes}")
 
-        # Only for debug
-        # self.logger.warning(f"Changing num_boxes from {num_boxes} to 2 for debug")
-        # num_boxes = 2
-
-        boxes = boxes[0].cpu().detach().numpy().tolist()
+        # Rescale boxes to original image coordinates
+        boxes_np = boxes[0].cpu().detach().numpy()  # Shape: [N, 4]
+        boxes_rescaled = rescale_boxes(boxes_np, letterbox_shape, original_shape)
+        boxes_list = boxes_rescaled.tolist()
 
         class_ids = scores[0].argmax(dim=1)
         confidences = scores[0].max(dim=1).values
@@ -337,7 +359,7 @@ class Explanator:
             exp_box = {}
 
             exp_box["object_id"] = prediction_num
-            exp_box["bbox"] = boxes[prediction_num]
+            exp_box["bbox"] = boxes_list[prediction_num]
             class_id = class_ids[prediction_num].item()
             confidence = confidences[prediction_num].item()
             exp_box["class_id"] = class_id
@@ -358,8 +380,15 @@ class Explanator:
 
             # PCX visualization
             explanation_fig = plot_one_image_pcx_explanation(
-                model_name, self.person_vehicle_model, image_tensor,
-                self.person_car_dataset, class_id, n_concepts, n_refimgs,
+                model_name=model_name,
+                model=self.person_vehicle_model,
+                img=image_tensor,
+                orig_img=image,
+                dataset=self.person_car_dataset,  # Transformed dataset for model/CRP
+                orig_dataset=self.person_car_dataset_orig,  # Original images for cropping
+                class_id=class_id,
+                n_concepts=n_concepts,
+                n_refimgs=n_refimgs,
                 num_prototypes=prototype_dict,
                 prediction_num=prediction_num,
                 layer_name=layer,
@@ -388,7 +417,7 @@ class Explanator:
         explanation_entity = get_person_vehicle_detection_explanation_entity(
             original_image_bucket=original_image_bucket,
             original_image_filename=original_image_filename,
-            original_detection_boxes=boxes,
+            original_detection_boxes=boxes_list,
             original_detection_class_categories=class_ids.cpu().detach().numpy().tolist(),
             original_detection_confidences=confidences.cpu().detach().numpy().tolist(),
             explanation_boxes=explanation_boxes,

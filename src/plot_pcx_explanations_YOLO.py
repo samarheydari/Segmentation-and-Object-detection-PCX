@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 # Add the parent directory to the Python path - bad practice, but it's just for the example
 import sys
 import logging
+from PIL import Image
 
 # Configure logging to display debug information
 logging.basicConfig(level=logging.DEBUG)
@@ -29,11 +30,12 @@ from matplotlib.font_manager import FontProperties
 import matplotlib.patches as patches
 import joblib
 from PIL import ImageDraw
-from src.pcx_helper import get_ref_images
+from src.pcx_helper import get_ref_images, get_detection_crop, get_detection_crop_input
+from src.letterbox_utils import rescale_boxes
 
 def plot_pcx_explanations(
     class_id, model_name, model, dataset, sample_id, n_concepts, n_refimgs, num_prototypes, prediction_num, layer_name,
-        ref_imgs_path, output_dir_pcx, output_dir_crp, use_half=False):
+        ref_imgs_path, output_dir_pcx, output_dir_crp):
 
     # Load the input image and label
     img, t = dataset[sample_id]
@@ -41,12 +43,12 @@ def plot_pcx_explanations(
     # Generate the explanation figure
     fig = plot_one_image_pcx_explanation(
         model_name, model, img, dataset, class_id, n_concepts, n_refimgs, num_prototypes, prediction_num, layer_name,
-        ref_imgs_path, output_dir_pcx, output_dir_crp, use_half=use_half)
+        ref_imgs_path, output_dir_pcx, output_dir_crp)
 
     # Display and save the plot
     plt.figure(fig)
     plt.tight_layout()
-    plot_dir = "output/pcx/pcx_plots"
+    plot_dir = f"{output_dir_pcx}/pcx_plots"
     os.makedirs(plot_dir, exist_ok=True)
     safe_layer = layer_name.replace('.', '_')
     fname = (
@@ -63,20 +65,17 @@ def plot_pcx_explanations(
 
 
 def plot_one_image_pcx_explanation(
-    model_name, model, img, dataset, class_id, n_concepts, n_refimgs, num_prototypes, prediction_num, layer_name,
-        ref_imgs_path, output_dir_pcx, output_dir_crp, use_half=False, outside_logger=None
+        model_name, model, img, orig_img, dataset, orig_dataset, class_id, n_concepts, n_refimgs, num_prototypes, prediction_num, layer_name,
+        ref_imgs_path, output_dir_pcx, output_dir_crp, outside_logger=None
 ):
-
-    if outside_logger:
-        logger = outside_logger
+    import logging
+    logger = outside_logger if outside_logger is not None else logging.getLogger(__name__)
 
     # Set device
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # Model has to be in eval state
     model.to(device)
     model.eval()
-    if use_half:
-        model.half()
 
     # Prepare layer names for CRP attribution
     layer_names = get_layer_names(model, types=[torch.nn.Conv2d])
@@ -103,10 +102,20 @@ def plot_one_image_pcx_explanation(
     folder = f"{output_dir_pcx}/{layer_name}/"
     attributions = torch.from_numpy(np.load(folder + f"attributions_{class_id}.npy"))
 
+    meta_path = os.path.join(folder, f"meta_class_{class_id}.json")
+    if os.path.exists(meta_path):
+        import json
+        with open(meta_path, "r") as f:
+            meta = json.load(f)
+    else:
+        # Fallback: assume 1:1 mapping (old format)
+        meta = [{"dataset_idx": i, "box_idx": 0} for i in range(len(attributions))]
+        logger.warning(f"No metadata file found at {meta_path}, assuming 1:1 mapping")
+
     # Training GMM based on relevances if not done already
     # Initialize Gaussian Mixture Model (GMM) with specified number of prototypes as components
-    cache_path = f'output/pcx/gmms/gmm_cache_{layer_name}_class_{class_id}.pkl'
-    prototype_cache_path = f'output/pcx/gmm_prototypes/prototype_gmms_cache_{layer_name}_class_{class_id}.pkl'
+    cache_path = f'{output_dir_pcx}/gmms/gmm_cache_{layer_name}_class_{class_id}.pkl'
+    prototype_cache_path = f'{output_dir_pcx}/gmm_prototypes/prototype_gmms_cache_{layer_name}_class_{class_id}.pkl'
 
     # Create directories if they do not exist
     os.makedirs(os.path.dirname(cache_path), exist_ok=True)
@@ -133,10 +142,7 @@ def plot_one_image_pcx_explanation(
     # Calculating scores of the dataset, used further for outlier detection
     scores = gmm.score_samples(attributions)
 
-    if use_half:
-        data = data.half().to(device).requires_grad_(True)
-    else:
-        data = data.to(device).requires_grad_(True)
+    data = data.to(device).requires_grad_(True)
 
     # Running attribution on the input image
     attribution.take_prediction = prediction_num
@@ -151,19 +157,37 @@ def plot_one_image_pcx_explanation(
     # Channel (neuron) relevance on the given layer for this image
     channel_rels = cc.attribute(attr.relevances[layer_name], abs_norm=True)
 
-    # Finding how well given sample fits to prototypes, finding the closest prototype
-    score_sample = gmm.score_samples(channel_rels.detach().cpu())
-    likelihoods = [g_.score_samples(channel_rels.detach().cpu()) for g_ in prototype_gmms]
-    mean = gmm.means_[np.argmax(likelihoods)]
-    mean = torch.from_numpy(mean)
-    closest_sample_to_mean = ((attributions - mean[None])).pow(2).sum(dim=1).argmin().item()
+    # --- sample fit (mixture) ---
+    score_sample = gmm.score_samples(channel_rels.detach().cpu())  # shape (1,)
 
-    # Closest prototype
-    data_p, target_p = dataset[closest_sample_to_mean]
-    if use_half:
-        data_p = data_p[None, ...].to(device).half()
-    else:
-        data_p = data_p[None, ...].to(device)
+    # === PREP ARRAYS & CHOOSE PROTOTYPE (γ) ===
+    x_star = channel_rels.detach().cpu().numpy()  # (1, C)
+    A = attributions.detach().cpu().numpy().astype(np.float32)  # (N, C)
+
+    post = gmm.predict_proba(x_star)  # (1, K) responsibilities
+    chosen_proto = int(post.argmax(axis=1)[0])
+
+    score_sample = float(score_sample[0])
+
+    # === MEAN & MAHALANOBIS NEAREST SAMPLE ===
+    mean = torch.from_numpy(gmm.means_[chosen_proto])
+
+    mu = gmm.means_[chosen_proto].astype(np.float32)  # (C,)
+    L = gmm.precisions_cholesky_[chosen_proto].astype(np.float32)  # (C, C), upper chol of precision
+    diff = A - mu[None, :]
+    y = diff @ L.T
+    m2 = np.sum(y * y, axis=1)  # Mahalanobis^2
+
+    closest_row = int(np.argmin(m2))
+    ds_idx = int(meta[closest_row]["dataset_idx"])
+
+    # Validate before accessing
+    if ds_idx >= len(dataset):
+        logger.error(f"ds_idx {ds_idx} >= dataset size {len(dataset)}")
+        raise IndexError(f"Dataset index {ds_idx} out of range. Regenerate attributions with current dataset.")
+
+    data_p, target_p = dataset[ds_idx]
+    data_p = data_p[None, ...].to(device)
 
     # Getting top concepts/neurons for the given image in the given layer
     topk = torch.topk(channel_rels[0], n_concepts)
@@ -287,7 +311,7 @@ def plot_one_image_pcx_explanation(
     # Rewriting for clarity
     _, batch_predicted_boxes = model.predict_with_boxes(data_p)
     sample_predicted_boxes = batch_predicted_boxes[0]
-    predicted_boxes = sample_predicted_boxes[0]
+    predicted_boxes_p = sample_predicted_boxes[0]
 
     # predicted_classes = attr_p.prediction.argmax(dim=2)[0]
     # print(f"Predicted boxes: {predicted_boxes}")
@@ -300,7 +324,7 @@ def plot_one_image_pcx_explanation(
     # filtered_boxes = [b for b, c in zip(predicted_boxes, predicted_classes) if c == class_id]
     # predicted_boxes = filtered_boxes[prediction_num]
 
-    boxes = predicted_boxes.clone().detach().float()[None]
+    boxes = predicted_boxes_p.clone().detach().float()[None]
     colors = ["#ffcc00" for _ in boxes]
     result = draw_bounding_boxes((dataset.reverse_normalization(data_p[0])).type(torch.uint8),
                                  boxes, colors=colors, width=8)
@@ -308,7 +332,7 @@ def plot_one_image_pcx_explanation(
     img_prototype = F.to_pil_image(result)
 
     # Get bounding box coordinates.
-    box_coords = predicted_boxes.clone().detach().cpu().numpy()
+    box_coords = predicted_boxes_p.clone().detach().cpu().numpy()
     x_min, y_min, x_max, y_max = box_coords.astype(int)
     orig_img_tensor = dataset.reverse_normalization(data_p[0])
     orig_img_pil = F.to_pil_image(orig_img_tensor.type(torch.uint8))
@@ -334,6 +358,60 @@ def plot_one_image_pcx_explanation(
     adjusted_box = (x_min - crop_x_min, y_min - crop_y_min, x_max - crop_x_min, y_max - crop_y_min)
     draw.rectangle(adjusted_box, outline="yellow", width=2)
 
+    # model-input spatial size (W,H) = (data.shape[-1], data.shape[-2])
+    inW, inH = int(data.shape[-1]), int(data.shape[-2])
+
+    # class-specific context (matches your earlier idea: more zoom for class 0)
+    ctx = 2.0 if class_id == 0 else 0.4
+
+    detection_crop_input = get_detection_crop_input(
+        orig_img=orig_img,  # the original full-resolution image you passed into the function
+        box=predicted_boxes,  # the chosen detection in model-input pixels
+        input_size=(inW, inH),
+        context=ctx,
+        draw_box=True,
+    )
+
+    # Get original prototype image from orig_dataset
+    orig_img_p, _ = orig_dataset[ds_idx]
+
+    # Get original shape for prototype
+    if isinstance(orig_img_p, np.ndarray):
+        original_shape_p = orig_img_p.shape[:2]  # (H, W)
+    elif isinstance(orig_img_p, Image.Image):
+        original_shape_p = (orig_img_p.size[1], orig_img_p.size[0])  # PIL (W,H) -> (H,W)
+    else:
+        # Assume it's a tensor (C, H, W) or similar - unlikely for orig_dataset
+        original_shape_p = orig_img_p.shape[-2:]
+
+    # Get letterbox shape for prototype from transformed dataset
+    letterbox_shape_p = (data_p.shape[2], data_p.shape[3])  # (H, W) from (B, C, H, W)
+
+    # Get boxes in letterbox coordinates
+    _, batch_predicted_boxes_p = model.predict_with_boxes(data_p)
+    sample_predicted_boxes_p = batch_predicted_boxes_p[0]
+
+    # Rescale boxes to original prototype image coordinates
+    boxes_np_p = sample_predicted_boxes_p.cpu().detach().numpy()
+    boxes_rescaled_p = rescale_boxes(boxes_np_p, letterbox_shape_p, original_shape_p)
+    predicted_boxes_p_original = boxes_rescaled_p[0]  # First detection for prototype
+
+    # Convert BGR to RGB if needed (orig_dataset might return BGR)
+    if isinstance(orig_img_p, np.ndarray):
+        orig_img_p_rgb = orig_img_p[:, :, ::-1].copy()
+    else:
+        orig_img_p_rgb = orig_img_p
+
+    # Get prototype crop from original high-res image
+    ctx_p = 2.0 if class_id == 0 else 0.4
+    detection_crop_p = get_detection_crop_input(
+        orig_img=orig_img_p_rgb,
+        box=predicted_boxes_p_original,
+        input_size=original_shape_p[::-1],  # (W, H)
+        context=ctx_p,
+        draw_box=True,
+    )
+
     # --- Defining plot ---
     width_ratios = [1, 1, n_refimgs/4, 1, 1, 1]
     n_rows = max(n_concepts, 4)  # always at least 4 rows
@@ -357,11 +435,13 @@ def plot_one_image_pcx_explanation(
             if c == 0:
                 if r == 0:
                     ax.set_title("input")
+                    img_ = img_.resize((150, 150), Image.BILINEAR)
                     ax.imshow(img_)
                 elif r == 1:
                     ax.set_title("heatmap")
-                    ax.imshow(imgify(attr.heatmap.detach().cpu(),
-                                     cmap="bwr", symmetric=True, level=3))
+                    img = imgify(attr.heatmap.detach().cpu(), cmap="bwr", symmetric=True, level=5)
+                    img = img.resize((150, 150), Image.BILINEAR)
+                    ax.imshow(img)
                 elif r == 2:
                     ax.set_title("Detection", fontsize=10)
                     label_str = f"{pred_label} {pred_confidence*100:.1f}%"
@@ -374,7 +454,7 @@ def plot_one_image_pcx_explanation(
                         color="yellow",
                         va="top", ha="left",
                         bbox=dict(boxstyle="round,pad=0.2", facecolor="black", alpha=0.3, edgecolor="none"))
-                    ax.imshow(cropped_img)
+                    ax.imshow(detection_crop_input)
                 elif r == 3:
                     ax.set_title("class likelihood")
                     h = ax.hist(scores, bins=20, color='k')
@@ -384,27 +464,33 @@ def plot_one_image_pcx_explanation(
                     ax.set_ylabel("density")
                     ax.set_xlabel("log-likelihood")
                     ax.set_xticks([]); ax.set_yticks([])
-                    # outlier label
-                    lt, ut = np.percentile(scores, 1), np.percentile(scores, 99)
-                    txt = ("Outlier" if score_sample < lt or score_sample > ut
-                           else "Ordinary")
-                    bc = dict(boxstyle="round,pad=0.3",
-                              edgecolor=("red" if "Outlier" in txt else "green"),
-                              facecolor=("red" if "Outlier" in txt else "green"),
-                              alpha=0.3, linewidth=4)
-                    ax.text(0.5, -0.35, txt, transform=ax.transAxes,
-                            ha="center", fontsize=10, fontweight='bold',
-                            color=("red" if "Outlier" in txt else "green"),
-                            bbox=bc)
+
+                    # Define threshold for outlier detection
+                    lower_threshold = np.percentile(scores, 1)
+                    logger.debug(
+                        f"[OUTLIER] strategy=global_p5 | p5={lower_threshold:.3f} | score_sample={float(score_sample):.3f}")
+                    outlier_text = "Outlier" if score_sample < lower_threshold else "Ordinary"
+                    logger.debug(f"[OUTLIER] result={outlier_text}")
+
+                    # Determine if the sample is an outlier
+                    outlier_text = "Outlier" if score_sample < lower_threshold else "Ordinary"
+                    bbox_props = dict(boxstyle="round,pad=0.3",
+                                      edgecolor="red" if outlier_text == "Outlier" else "green",
+                                      facecolor="red" if outlier_text == "Outlier" else "green", alpha=0.3, linewidth=4)
+                    ax.text(0.5, -0.35, outlier_text, transform=ax.transAxes, ha="center", fontsize=10,
+                            fontweight='bold', color="red" if outlier_text == "Outlier" else "green", bbox=bbox_props)
+
+                else:
+                    ax.axis("off")
 
             # --- col 1: input localization ---
             elif c == 1:
-                ax.imshow(imgify(cond_heatmap[r],
-                                 symmetric=True, cmap="bwr", padding=True, level=3))
-                ax.set_ylabel(f"concept {topk_ind[r]}\n"
-                              f"relevance: {channel_rels[0,topk_ind[r]]*100:2.1f}")
                 if r == 0:
                     ax.set_title("Input localization")
+                cond_h =imgify(cond_heatmap[r], symmetric=True, cmap="bwr", padding=True, level=5)
+                cond_h = cond_h.resize((150, 150), Image.BILINEAR)
+                ax.imshow(cond_h)
+                ax.set_ylabel(f"concept {topk_ind[r]}\n relevance: {(channel_rels[0][topk_ind[r]] * 100):2.1f}")
 
             # --- col 2: reference imgs grid ---
             elif c == 2:
@@ -443,28 +529,30 @@ def plot_one_image_pcx_explanation(
 
             # --- col 4: proto localization ---
             elif c == 4:
-                ax.imshow(imgify(cond_heatmap_p[r],
-                                 symmetric=True, cmap="bwr", padding=True, level=3))
-                ax.set_ylabel(f"concept {topk_ind[r]}\n"
-                              f"relevance: {mean[topk_ind[r]]*100:2.1f}")
                 if r == 0:
                     ax.set_title("Prot localization")
+                ax.imshow(imgify(cond_heatmap_p[r], symmetric=True, cmap="bwr", padding=True, level=5))
+                ax.yaxis.set_label_position("right")
+                ax.set_ylabel(f"concept {topk_ind[r]}\n"f"relevance: {mean[topk_ind[r]]*100:2.1f}")
 
             # --- col 5: prototype image / heatmap / detection ---
             elif c == 5:
                 if r == 0:
                     ax.set_title("prototype")
+                    img_prototype = img_prototype.resize((150, 150), Image.BILINEAR)
                     ax.imshow(img_prototype)
                 elif r == 1:
-                    ax.set_title("heatmap")
-                    ax.imshow(imgify(attr_p_heatmap,
-                                     cmap="bwr", symmetric=True, level=3))
+                    img = imgify(attr_p_heatmap, cmap="bwr", symmetric=True, level=5)
+                    img = img.resize((150, 150), Image.BILINEAR)
+                    ax.imshow(img)
                 elif r == 2:
                     ax.set_title("detection")
-                    ax.imshow(cropped_img_prot)
+                    ax.imshow(detection_crop_p)
                 else:
                     ax.axis("off")
 
             ax.set_xticks([]); ax.set_yticks([])
+
+    plt.tight_layout()
 
     return fig

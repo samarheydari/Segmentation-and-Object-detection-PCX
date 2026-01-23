@@ -15,7 +15,7 @@ class PersonCarDataset(Dataset):
         self.transform = transform
 
         # Get list of image and label files, ensuring they are sorted correctly
-        self.image_files = natsort.natsorted([f for f in os.listdir(self.image_dir) if f.endswith(".JPG")])
+        self.image_files = natsort.natsorted([f for f in os.listdir(self.image_dir) if f.endswith(('.png', '.jpg', '.jpeg', '.JPG'))])# Updated the hardcoded '.JPG' to support additional image formats
         self.label_files = natsort.natsorted([f for f in os.listdir(self.label_dir) if f.endswith(".txt")])
 
         # Filter out labels that don't have images

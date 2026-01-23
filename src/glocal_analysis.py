@@ -3,6 +3,7 @@ import sys
 
 from crp.concepts import ChannelConcept
 from crp.helper import get_layer_names
+from crp.maximization import Maximization
 import torch
 
 from LCRP.utils.crp_configs import ATTRIBUTORS, CANONIZERS, VISUALIZATIONS, COMPOSITES
@@ -31,5 +32,13 @@ def run_analysis(model_name, model, dataset, output_dir, device):
                                     preprocess_fn=lambda x: x,
                                     path=output_dir,
                                     max_target="max")
+
+    # increase the number of ref images indices in the crp files from 40(default) to 100 to avoid getting fewer ref images as requested after filtering
+    NEW_SAMPLE_SIZE = 100
+    fv.RelMax.SAMPLE_SIZE = NEW_SAMPLE_SIZE
+    fv.ActMax.SAMPLE_SIZE = NEW_SAMPLE_SIZE
+    fv.RelStats.SAMPLE_SIZE = NEW_SAMPLE_SIZE
+    fv.ActStats.SAMPLE_SIZE = NEW_SAMPLE_SIZE
+
     # Here running the analysis on the whole dataset, batch_size is 8, checkpoint is 100
     fv.run(composite, 0, len(dataset), batch_size=8, checkpoint=100)
