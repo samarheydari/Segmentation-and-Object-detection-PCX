@@ -5,16 +5,17 @@ import torchvision
 import numpy as np
 import torchvision.transforms as transforms
 import matplotlib.pyplot as plt
-import gc
 
 # Add the parent directory to the Python path - bad practice, but it's just for the example
 import sys
 sys.path.append("..")
 
 from src.glocal_analysis import run_analysis 
-from datasets.flood_dataset_crp import FloodDataset
+from src.datasets.flood_dataset_crp import FloodDataset
 from src.datasets.DLR_dataset import DatasetDLR
+from src.plot_crp_explanations import plot_explanations, plot_one_image_explanation
 from src.minio_client import MinIOClient
+from LCRP.models import get_model 
 from crp.helper import get_layer_names
 from LCRP.utils.crp_configs import ATTRIBUTORS, CANONIZERS, VISUALIZATIONS, COMPOSITES
 from crp.concepts import ChannelConcept
@@ -34,8 +35,11 @@ import plotly.graph_objects as go
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-
-def get_ref_images(fv, topk_ind, layer_name, composite, n_ref=12, ref_imgs_save_path="output/ref_imgs_pidnet/"):
+logging.disable(logging.ERROR)
+# -------------------------
+# Small helpers
+# -------------------------
+def get_ref_images(fv, topk_ind, layer_name, composite, n_ref=12, ref_imgs_save_path="output/ref_imgs/"):
     ref_imgs_save_path = os.path.join(ref_imgs_save_path, f"{layer_name}.h5")
     os.makedirs(os.path.dirname(ref_imgs_save_path), exist_ok=True)
 
@@ -86,19 +90,14 @@ def get_ref_images(fv, topk_ind, layer_name, composite, n_ref=12, ref_imgs_save_
     return ref_imgs
 
 
-def plot_pcx_explanations_pidnet (model_name, model, dataset, image_tensor, n_concepts=5, n_refimgs=12, num_prototypes=2, layer_name="decoder.center.0.0", ref_imgs_path="output/ref_imgs/", output_dir_pcx="output/pcx/pidnet_flood/", output_dir_crp="output/crp/pidnet_flood/"):
-    """
-    Analyzes and plots a Prototypes-based Concept Explanation for a single image tensor.
-    This function accepts an image_tensor as input and returns only the figure.
-    """
-    # Model has to be in eval state
-    img = image_tensor[None, ...].to(device)
 
+def plot_pcx_explanations(model_name, model, dataset, sample_id, n_concepts=5, n_refimgs=12, num_prototypes=2, layer_name="decoder.center.0.0", ref_imgs_path="output/ref_imgs/", output_dir_pcx="output/pcx/unet_flood/", output_dir_crp="output/crp/unet_flood_old/"):
+    # Model has to be in eval state
     model.eval()
     layer_names = get_layer_names(model, types=[torch.nn.Conv2d])
 
     # Setting up CRP 
-    attribution = ATTRIBUTORS[model_name](model)
+    attribution = ATTRIBUTORS["pidnet"](model)
     composite = COMPOSITES[model_name](canonizers=[CANONIZERS[model_name]()])
     condition = [{"y": 1}]    
     fv = VISUALIZATIONS[model_name](attribution,
@@ -110,8 +109,7 @@ def plot_pcx_explanations_pidnet (model_name, model, dataset, image_tensor, n_co
     cc = ChannelConcept()
 
     # Getting the sample we selected
-    data = img   
-    class_id = 1
+    data, _ = fv.get_data_sample(sample_id, preprocessing=False)    
 
     # Loading relevances for this layer,
     folder = f"{output_dir_pcx}/{layer_name}/"
@@ -121,7 +119,18 @@ def plot_pcx_explanations_pidnet (model_name, model, dataset, image_tensor, n_co
     
     # Training GMM based on relevances if not done already
     # Initialize Gaussian Mixture Model (GMM) with specified number of prototypes as components
-    gmm = GaussianMixture(n_components=num_prototypes, reg_covar=1e-5, random_state=0).fit(attributions.numpy())
+    cache_path = f'output/pcx/gmm_cache_{layer_name}.pkl'
+    prototype_cache_path = f'output/pcx/prototype_gmms_cache_{layer_name}.pkl'
+
+    if os.path.exists(cache_path) and os.path.exists(prototype_cache_path):
+        # Load the GMM and individual GMMs from the cache files
+        gmm = joblib.load(cache_path)
+        prototype_gmms = joblib.load(prototype_cache_path)
+    else:
+        # Fit the GMM
+        gmm = GaussianMixture(n_components=num_prototypes, reg_covar=1e-5, random_state=0).fit(attributions)
+        # Save the GMM and individual GMMs to cache files
+        joblib.dump(gmm, cache_path)
 
     # Create individual GMMs for each prototype and store them in a list
     prototype_gmms = [GaussianMixture(n_components=1, covariance_type='full',) for p in range(num_prototypes)]
@@ -131,12 +140,10 @@ def plot_pcx_explanations_pidnet (model_name, model, dataset, image_tensor, n_co
             for j, param in enumerate(gmm._get_parameters())])
 
     # Calculating scores of the dataset, used further for outlier detection
-    scores = gmm.score_samples(attributions.numpy())
-    
-    # Running attribution on the input image
-    img_copy = copy.deepcopy(img).requires_grad_()
+    scores = gmm.score_samples(attributions)
 
-    attr = attribution(img_copy, condition, composite, record_layer=[layer_name],
+    # Running attribution on the input image
+    attr = attribution(data.requires_grad_(), condition, composite, record_layer=[layer_name],
                            init_rel=1)
     
     # Channel (neuron) relevance on the given layer for this image
@@ -172,7 +179,7 @@ def plot_pcx_explanations_pidnet (model_name, model, dataset, image_tensor, n_co
     cond_heatmap, _, _, _ = attribution(data.requires_grad_(), conditions, composite)
 
     # Mask for plotting segmentation
-    mask = (attr.prediction[0].argmax(dim=0) == class_id).detach().cpu()
+    mask = (attr.prediction[0].argmax(dim=0) == 1).detach().cpu()
     sample_ = dataset.reverse_augmentation(data)
     # Resizing mask in pidnet
     if "pidnet" in model_name:
@@ -186,7 +193,7 @@ def plot_pcx_explanations_pidnet (model_name, model, dataset, image_tensor, n_co
         mask = resized_mask.bool().squeeze().squeeze()  # shape (480, 480)
     img_ = F.to_pil_image(draw_segmentation_masks(sample_[:3, :, :][0], masks=mask, alpha=0.3, colors=["red"]))
 
-    # mask_prototype = (attr_p.prediction[0].argmax(dim=0) == class_id).detach().cpu()
+    # mask_prototype = (attr_p.prediction[0].argmax(dim=0) == 1).detach().cpu()
     mask_prototype = (((target_p - target_p.min()) / (target_p.max() - target_p.min())) > 0.5)[0]
     sample_prototype = dataset.reverse_augmentation(data_p)
     img_prototype = F.to_pil_image(draw_segmentation_masks(sample_prototype[:3, :, :][0], masks=mask_prototype, alpha=0.3, colors=["red"]))
@@ -205,9 +212,8 @@ def plot_pcx_explanations_pidnet (model_name, model, dataset, image_tensor, n_co
             if c == 0:
                 if r == 0:
                     ax.set_title("input")
-                    # Convert the input tensor to a displayable format
-                    input_img = dataset.reverse_augmentation(img[0])
-                    ax.imshow(input_img.permute(1, 2, 0).cpu().numpy())
+                    img = imgify(fv.get_data_sample(sample_id, preprocessing=False)[0][0])
+                    ax.imshow(img)
                     ax.imshow(np.asarray(img_))
                     ax.contour(mask, colors="black", linewidths=[1])
                 elif r == 1:
@@ -325,7 +331,9 @@ def plot_pcx_explanations_pidnet (model_name, model, dataset, image_tensor, n_co
     # Save and show the generated figures.
     plt.tight_layout()
 
-    return fig
+    plt.show()
+
+    return gmm, mean, channel_rels
 
 
 
@@ -347,10 +355,16 @@ def compute_outlier_scores(model_name, model, dataset, layer_name="decoder.cente
     # Load or compute the GMM
     folder = f"{output_dir_pcx}/{layer_name}/"
     attributions = torch.from_numpy(np.load(folder + "attributions.npy"))
-    gmm = GaussianMixture(n_components=num_prototypes, reg_covar=1e-5, random_state=0).fit(attributions.numpy())
+    cache_path = f'output/pcx/gmm_cache_{layer_name}.pkl'
+
+    if os.path.exists(cache_path):
+        gmm = joblib.load(cache_path)
+    else:
+        gmm = GaussianMixture(n_components=num_prototypes, reg_covar=1e-5, random_state=0).fit(attributions)
+        joblib.dump(gmm, cache_path)
 
     #log-likelihood scores
-    scores = gmm.score_samples(attributions.numpy())
+    scores = gmm.score_samples(attributions)
 
     # Define outlier thresholds (e.g., 1st and 99th percentiles)
     lower_threshold = np.percentile(scores, 1)
@@ -361,27 +375,3 @@ def compute_outlier_scores(model_name, model, dataset, layer_name="decoder.cente
                 if score < lower_threshold or score > upper_threshold]
 
     return outliers, scores, lower_threshold, upper_threshold
-
-
-
-def plot_one_image_pidnet_explanation(model_name, model, dataset, img, n_concepts , n_refimgs, num_prototypes, layer_name , ref_imgs_path,  output_dir_pcx , output_dir_crp):
-    try:
-        # Reset max memory tracking
-        if torch.cuda.is_available():
-            torch.cuda.reset_max_memory_allocated()
-            
-        # Run optimized version
-        fig = plot_pcx_explanations_pidnet(model_name, model, dataset, img, n_concepts, n_refimgs, num_prototypes , layer_name , ref_imgs_path , output_dir_pcx , output_dir_crp)
-
-        # Ensure any remaining tensors are cleared
-        gc.collect()
-        torch.cuda.empty_cache()
-        
-        return fig
-    
-    except Exception as e:
-        # In case of an error, make sure memory is cleared
-        print(f"Error during explanation: {e}")
-        gc.collect()
-        torch.cuda.empty_cache()
-        raise

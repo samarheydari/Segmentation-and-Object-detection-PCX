@@ -178,7 +178,7 @@ def plot_one_image_pcx_explanation(
 
     attribution.take_prediction = prediction_num
     cond_heatmap, _, _, _ = attribution(data.requires_grad_(), conditions, composite, exclude_parallel=True)
-    logger.debug(f"Running conditional attribution on the input image, {attribution.take_prediction}")
+    local_logger.debug(f"Running conditional attribution on the input image, {attribution.take_prediction}")
 
     # ─── define cache dir & files ────────────────────────────────
     cache_dir = os.path.join(output_dir_pcx, "cache", layer_name, f"class_{class_id}_protos_{num_prototypes}")

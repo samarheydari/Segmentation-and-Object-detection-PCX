@@ -43,83 +43,56 @@ def _as_uint8_array(image: Image.Image) -> np.ndarray:
 # -------------------------
 # Reference images cache (HDF5)
 # -------------------------
-def get_ref_images(
-    fv,
-    topk_ind: np.ndarray,
-    layer_name: str,
-    composite,
-    n_ref: int = 12,
-    ref_imgs_save_path: str = "../examples/output/ref_images_pidnet_BRK/",
-) -> Dict[int, List[Image.Image]]:
-    """
-    Get and cache reference images. CPU/PIL based.
-    """
-    t0 = time.time()
-    path_h5 = os.path.join(ref_imgs_save_path, f"{layer_name}.h5")
-    os.makedirs(os.path.dirname(path_h5), exist_ok=True)
 
-    print(f"[get_ref_images] start; layer={layer_name}, n_ref={n_ref}, cache={path_h5}")
-    ref_imgs: Dict[int, List[Image.Image]] = {}
-    keys_str = list(map(str, topk_ind))
+def get_ref_images(fv, topk_ind, layer_name, composite, n_ref=12, ref_imgs_save_path="output/ref_imgs/"):
+    ref_imgs_save_path = os.path.join(ref_imgs_save_path, f"{layer_name}.h5")
+    os.makedirs(os.path.dirname(ref_imgs_save_path), exist_ok=True)
 
-    if os.path.exists(path_h5):
-        print("[get_ref_images] cache exists -> reading known keys")
-        with h5py.File(path_h5, "a") as f:
-            existing = set(f.keys())
-            missing = [k for k in keys_str if k not in existing]
+    ref_imgs = {}
+    missing_keys = list(map(str, topk_ind))
 
-            # read existing
-            for k in keys_str:
-                if k in f:
-                    grp = f[k]
-                    items = sorted(grp.keys(), key=lambda s: int(s))
-                    imgs = [Image.fromarray(grp[i][:]) for i in items]
-                    ref_imgs[int(k)] = imgs
-                    print(f"[get_ref_images] loaded key={k} count={len(imgs)}")
+    if os.path.exists(ref_imgs_save_path):
+        with h5py.File(ref_imgs_save_path, "a") as f:
+            existing_keys = set(f.keys())
+            missing_keys = [str(k) for k in topk_ind if str(k) not in existing_keys]
 
-            # compute missing
-            if missing:
-                print(f"[get_ref_images] computing missing={missing}")
-                new_refs = fv.get_max_reference(
-                    [int(k) for k in missing],
-                    layer_name,
-                    "relevance",
-                    (0, n_ref),
-                    composite=composite,
-                    rf=False,
-                    plot_fn=vis_opaque_img_border,
-                )
+            for k in topk_ind:
+                str_k = str(k)
+                if str_k in f:
+                    group = f[str_k]
+                    ref_imgs[int(str_k)] = [Image.fromarray(group[str(idx)][:]) for idx in sorted(group.keys(), key=int)]
+
+            if missing_keys:
+                print(f"Calculating and saving missing reference images for keys: {missing_keys}")
+                new_refs = fv.get_max_reference([int(k) for k in missing_keys], layer_name, "relevance", (0, n_ref),
+                                                composite=composite, rf=True, plot_fn=vis_opaque_img_border)
                 for key, images_list in new_refs.items():
-                    grp = f.create_group(str(key))
-                    take = images_list[:n_ref]
+                    group = f.create_group(str(key))
+                    assert len(images_list) >= n_ref
                     ref_imgs[key] = []
-                    for idx, im in enumerate(take):
-                        if isinstance(im, Image.Image):
-                            arr = _as_uint8_array(im)
-                            grp.create_dataset(str(idx), data=arr, compression="gzip", compression_opts=4)
-                            ref_imgs[key].append(im)
-                    print(f"[get_ref_images] saved key={key} count={len(ref_imgs[key])}")
+                    for idx, image in enumerate(images_list[:n_ref]):
+                        if isinstance(image, Image.Image):
+                            arr = np.array(image)
+                            group.create_dataset(str(idx), data=arr)
+                            ref_imgs[key].append(image)
+                        else:
+                            print(f"Warning: Item '{idx}' in key '{key}' is not a PIL image and will not be saved.")
     else:
-        print("[get_ref_images] cache missing -> computing all")
-        refs = fv.get_max_reference(
-            topk_ind.tolist(), layer_name, "relevance", (0, n_ref),
-            composite=composite, rf=False, plot_fn=vis_opaque_img_border
-        )
-        with h5py.File(path_h5, "w") as f:
-            for key, images_list in refs.items():
-                grp = f.create_group(str(key))
-                take = images_list[:n_ref]
-                ref_imgs[key] = []
-                for idx, im in enumerate(take):
-                    if isinstance(im, Image.Image):
-                        arr = _as_uint8_array(im)
-                        grp.create_dataset(str(idx), data=arr, compression="gzip", compression_opts=4)
-                        ref_imgs[key].append(im)
-                print(f"[get_ref_images] saved key={key} count={len(ref_imgs[key])}")
+        print("Reference image file does not exist, calculating all.")
+        ref_imgs = fv.get_max_reference(topk_ind, layer_name, "relevance", (0, n_ref),
+                                        composite=composite, rf=True, plot_fn=vis_opaque_img_border)
+        with h5py.File(ref_imgs_save_path, "w") as f:
+            for key, images_list in ref_imgs.items():
+                group = f.create_group(str(key))
+                assert len(images_list) >= n_ref
+                for idx, image in enumerate(images_list[:n_ref]):
+                    if isinstance(image, Image.Image):
+                        arr = np.array(image)
+                        group.create_dataset(str(idx), data=arr)
+                    else:
+                        print(f"Warning: Item '{idx}' in key '{key}' is not a PIL image and will not be saved.")
 
-    print(f"[get_ref_images] done in {time.time() - t0:.2f}s; keys={list(ref_imgs.keys())}")
     return ref_imgs
-
 
 # -------------------------
 # Main plotting entry
@@ -135,7 +108,8 @@ def plot_pcx_explanations(
     num_prototypes: int,
     ref_imgs_path: str,
     output_dir_crp: str,
-    output_dir_pcx: str):
+    output_dir_pcx: str,
+    outlier_percentile: float = 0.10):
     print("[plot_pcx_explanations] starting")
     img, target = dataset[sample_id]
     print(f"[plot_pcx_explanations] sample_id={sample_id} img.shape={tuple(img.shape)}")
@@ -153,6 +127,7 @@ def plot_pcx_explanations(
         ref_imgs_path=ref_imgs_path,
         output_dir_crp=output_dir_crp,
         output_dir_pcx=output_dir_pcx,
+        outlier_percentile=outlier_percentile,
     )
 
     print("[plot_pcx_explanations] finished")
@@ -171,6 +146,7 @@ def plot_one_image_pcx_explanation(
     ref_imgs_path: str,
     output_dir_crp: str,
     output_dir_pcx: str,
+    outlier_percentile: float = 1.0,
 ) -> plt.Figure:
     t_start = time.time()
     device = "cpu"  # keep CPU for sklearn compatibility
@@ -313,12 +289,13 @@ def plot_one_image_pcx_explanation(
     mean = torch.from_numpy(gmm.means_[best_proto])  # [C]
     print(f"[gmm] sample score={score_sample:.4f}, best_proto={best_proto}")
 
-    # Pick the dataset sample closest to the chosen prototype
-    print("[gmm] finding closest sample to prototype mean")
+    # Pick the dataset sample closest to the CURRENT SAMPLE
+    print("[gmm] finding closest sample to current input sample")
     attributions_t = torch.from_numpy(attributions_np)  # [N,C]
-    dists = (attributions_t - mean[None, :]).pow(2).sum(dim=1)  # [N]
+    sample_vec_torch = torch.from_numpy(sample_vec).squeeze(0)  # [C]
+    dists = (attributions_t - sample_vec_torch[None, :]).pow(2).sum(dim=1)  # [N]
     closest_idx = int(torch.argmin(dists).item())
-    print(f"[gmm] closest_idx={closest_idx}")
+    print(f"[gmm] closest_idx={closest_idx} (closest to input sample)")
 
     # Prototype image and cond heatmaps
     data_p, _ = dataset[closest_idx]
@@ -366,8 +343,8 @@ def plot_one_image_pcx_explanation(
     proto_img_res = resize(img_prototype_overlay)
     proto_heatmap_res = resize(proto_heatmap_pil)
 
-    # Percentile for outlier flag
-    p1 = np.percentile(scores, 1)
+    # Percentile for outlier flag (configurable via outlier_percentile parameter)
+    p_threshold = np.percentile(scores, outlier_percentile)
 
     for r, row_axs in enumerate(axs):
         for c, ax in enumerate(row_axs):
@@ -393,7 +370,7 @@ def plot_one_image_pcx_explanation(
                     ax.set_ylabel("density")
                     ax.set_xlabel("log-likelihood")
                     ax.set_xticks([]); ax.set_yticks([])
-                    lbl = "Outlier" if score_sample < p1 else "Ordinary"
+                    lbl = "Outlier" if score_sample < p_threshold else "Ordinary"
                     color = "red" if lbl == "Outlier" else "green"
                     ax.text(
                         0.5, -0.35, lbl, transform=ax.transAxes, ha="center",
@@ -434,10 +411,10 @@ def plot_one_image_pcx_explanation(
                     ax.set_title("Difference to prot.")
                 ax.imshow(np.zeros((150, 150, 3)), alpha=0.2)
                 delta_R = (float(channel_rels_vec[topk_ind[r]].round(decimals=3)) - float(mean[topk_ind[r]].round(decimals=3))) * 100.0
-                if delta_R > 2:
+                if delta_R > 5:
                     textstr = f"ΔR = {delta_R:+.1f}%\n⚠ over-used"
                     edge_color = "#ff0000"
-                elif delta_R < -2:
+                elif delta_R < -5:
                     textstr = f"ΔR = {delta_R:+.1f}%\n⚠ under-used"
                     edge_color = "#ff0000"
                 else:

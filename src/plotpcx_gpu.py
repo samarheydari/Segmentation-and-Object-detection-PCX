@@ -35,7 +35,7 @@ from crp.image import imgify
 #sys.path.append("/Users/heydari/Desktop/test/FHHI-XAI-PIDNET/")
 
 from src.glocal_analysis import run_analysis
-from datasets.flood_dataset import FloodDataset
+from src.datasets.flood_dataset import FloodDataset
 from src.datasets.DLR_dataset import DatasetDLR
 from src.plot_crp_explanations import plot_explanations, plot_one_image_explanation
 from src.minio_client import MinIOClient
@@ -57,8 +57,9 @@ _HEATMAP_CMAP = LinearSegmentedColormap.from_list(
         (1.0, "#b00000"),
     ],
 )
-if HEATMAP_CMAP_NAME not in plt.colormaps():
-    plt.register_cmap(HEATMAP_CMAP_NAME, _HEATMAP_CMAP)
+import matplotlib.cm as cm
+# if HEATMAP_CMAP_NAME not in plt.colormaps():
+#     cm.register_cmap(HEATMAP_CMAP_NAME, _HEATMAP_CMAP)
 
 
 def _tensor_to_uint8_image(t: torch.Tensor) -> torch.Tensor:

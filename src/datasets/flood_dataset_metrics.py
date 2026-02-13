@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from src.datasets.base_dataset import BaseDataset
+from datasets.flood_dataset_crp import FloodDataset as BaseDataset
 
 
 class FloodDataset(BaseDataset):
