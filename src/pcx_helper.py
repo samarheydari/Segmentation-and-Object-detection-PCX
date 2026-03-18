@@ -286,7 +286,8 @@ def get_detection_crop(
 # ------------------------------------------
 # Prototype grid with concept references PNG
 # ------------------------------------------
-def prot_with_concepts(attributions, gmm, model, orig_dataset, device, class_id, layer_name, dataset, composite, fv):
+def prot_with_concepts(attributions, gmm, model, orig_dataset, device, class_id, layer_name, dataset, composite, fv,
+                       show_proto_concepts=True, skip_prototypes=None):
     NUM_SAMPLES_PER_PROTO = 6
     K_CONCEPTS_PER_PROTO = 3
     N_REF_PER_CONCEPT = 2
@@ -294,6 +295,7 @@ def prot_with_concepts(attributions, gmm, model, orig_dataset, device, class_id,
     A_np = attributions.detach().cpu().numpy()
     means = gmm.means_.astype(np.float32)
     K, C = means.shape
+    skip_prototypes = set(skip_prototypes or [])
 
     # nearest samples to each prototype mean
     dists_prots = np.linalg.norm(A_np[:, None, :] - means[None, :, :], axis=2)  # [N, K]
@@ -375,73 +377,94 @@ def prot_with_concepts(attributions, gmm, model, orig_dataset, device, class_id,
     Pn = means / (np.linalg.norm(means, axis=1, keepdims=True) + 1e-12)
     sim_mean = (Pn @ mu_n)
 
-    concept_matrix = torch.from_numpy(means[:, top_concepts]).T  # [N_CONCEPTS, K]
+    kept_proto_idxs = [pj for pj in range(K) if pj not in skip_prototypes]
+    if not kept_proto_idxs:
+        print("[proto_plot] all prototypes were skipped; not saving prototype plot.")
+        return
+
+    all_crops = [all_crops[pj] for pj in kept_proto_idxs]
+    coverage_pct = coverage_pct[kept_proto_idxs]
+    sim_mean = sim_mean[kept_proto_idxs]
+    means = means[kept_proto_idxs]
+    K_plot = len(kept_proto_idxs)
+
+    concept_matrix = torch.from_numpy(means[:, top_concepts]).T  # [N_CONCEPTS, K_plot]
 
     THUMB = 120
     resize_square = T.Compose([T.Resize(THUMB), T.CenterCrop((THUMB, THUMB))])
     all_resized = [[resize_square(t.clamp(0, 1)) for t in col] for col in all_crops]
 
     top_row_ratio = max(8, NUM_SAMPLES_PER_PROTO + 2)
-    fig_pc, axs = plt.subplots(
-        nrows=N_CONCEPTS + 1, ncols=K + 1,
-        figsize=(K + 6, N_CONCEPTS + 6), dpi=170,
-        gridspec_kw={'width_ratios': [6] + [1] * K, 'height_ratios': [top_row_ratio] + [1] * N_CONCEPTS}
-    )
+    if show_proto_concepts:
+        fig_pc, axs = plt.subplots(
+            nrows=N_CONCEPTS + 1, ncols=K_plot + 1,
+            figsize=(K_plot + 6, N_CONCEPTS + 6), dpi=170,
+            gridspec_kw={'width_ratios': [6] + [1] * K_plot, 'height_ratios': [top_row_ratio] + [1] * N_CONCEPTS}
+        )
+    else:
+        fig_pc, axs = plt.subplots(
+            nrows=1, ncols=K_plot,
+            figsize=(max(K_plot * 1.6, 4), top_row_ratio), dpi=170
+        )
+        axs = np.atleast_1d(axs)
 
     # top row: prototype strips (vertical)
-    for pj in range(K):
-        grid = torchvision.utils.make_grid(all_resized[pj], nrow=1, padding=1)
+    for local_idx, proto_idx in enumerate(kept_proto_idxs):
+        grid = torchvision.utils.make_grid(all_resized[local_idx], nrow=1, padding=1)
         grid_np = grid.permute(1, 2, 0).cpu().numpy()
         grid_np = (grid_np * 255.0).clip(0, 255).astype(np.uint8)
-        axs[0, pj + 1].imshow(grid_np, aspect='auto')
-        axs[0, pj + 1].set_title(f"Prototype {pj}\nCovers {coverage_pct[pj]:.0f}%\nSim. {sim_mean[pj]:.2f}", fontsize=9)
-        axs[0, pj + 1].axis("off")
-    axs[0, 0].axis("off")
+        ax = axs[0, local_idx + 1] if show_proto_concepts else axs[local_idx]
+        ax.imshow(grid_np, aspect='auto')
+        ax.set_title(f"Prototype {proto_idx}\nCovers {coverage_pct[local_idx]:.0f}%\nSim. {sim_mean[local_idx]:.2f}", fontsize=9)
+        ax.axis("off")
+    if show_proto_concepts:
+        axs[0, 0].axis("off")
 
-    for i, cidx in enumerate(top_concepts):
-        imgs = ref_imgs_concepts.get(int(cidx), [])
-        tiles = []
-        for im in imgs[:N_REF_PER_CONCEPT]:
-            if isinstance(im, Image.Image):
-                t = F.to_tensor(im).clamp(0, 1)
-            else:
-                arr = np.asarray(im)
-                if arr.ndim == 3:
-                    t = torch.from_numpy(arr).permute(2, 0, 1).float().div(255.0).clamp(0, 1)
+        for i, cidx in enumerate(top_concepts):
+            imgs = ref_imgs_concepts.get(int(cidx), [])
+            tiles = []
+            for im in imgs[:N_REF_PER_CONCEPT]:
+                if isinstance(im, Image.Image):
+                    t = F.to_tensor(im).clamp(0, 1)
                 else:
-                    continue
-            tiles.append(resize_square(t))
-        if len(tiles) == 0:
-            tiles = [torch.zeros(3, 150, 150)]
-        nrow = max(1, min(N_REF_PER_CONCEPT, len(tiles)))
-        grid = make_grid(tiles, nrow=nrow, padding=0)
-        grid_np = grid.permute(1, 2, 0).cpu().numpy()
-        grid_np = (grid_np * 255.0).clip(0, 255).astype(np.uint8)
+                    arr = np.asarray(im)
+                    if arr.ndim == 3:
+                        t = torch.from_numpy(arr).permute(2, 0, 1).float().div(255.0).clamp(0, 1)
+                    else:
+                        continue
+                tiles.append(resize_square(t))
+            if len(tiles) == 0:
+                tiles = [torch.zeros(3, 150, 150)]
+            nrow = max(1, min(N_REF_PER_CONCEPT, len(tiles)))
+            grid = make_grid(tiles, nrow=nrow, padding=0)
+            grid_np = grid.permute(1, 2, 0).cpu().numpy()
+            grid_np = (grid_np * 255.0).clip(0, 255).astype(np.uint8)
 
-        axs[i + 1, 0].imshow(grid_np)
-        axs[i + 1, 0].set_ylabel(f"concept {int(cidx)}", rotation=90, labelpad=8)
-        axs[i + 1, 0].set_yticks([]);
-        axs[i + 1, 0].set_xticks([])
+            axs[i + 1, 0].imshow(grid_np)
+            axs[i + 1, 0].set_ylabel(f"concept {int(cidx)}", rotation=90, labelpad=8)
+            axs[i + 1, 0].set_yticks([])
+            axs[i + 1, 0].set_xticks([])
 
-    vmax = float(concept_matrix.abs().max().item()) if hasattr(concept_matrix, "abs") else float(
-        np.abs(concept_matrix).max())
-    for i in range(N_CONCEPTS):
-        for j in range(K):
-            val = concept_matrix[i, j].item()
-            axs[i + 1, j + 1].imshow([[abs(val)]], vmin=0, vmax=vmax,
-                                     cmap=("Reds" if val >= 0 else "Blues"))
-            color = "white" if abs(val) > 0.5 * vmax else "black"
-            axs[i + 1, j + 1].text(0, 0, f"{val * 100:.1f}", ha="center", va="center", color=color, fontsize=10)
-            axs[i + 1, j + 1].axis("off")
+        vmax = float(concept_matrix.abs().max().item()) if hasattr(concept_matrix, "abs") else float(
+            np.abs(concept_matrix).max())
+        for i in range(N_CONCEPTS):
+            for j in range(K_plot):
+                val = concept_matrix[i, j].item()
+                axs[i + 1, j + 1].imshow([[abs(val)]], vmin=0, vmax=vmax,
+                                         cmap=("Reds" if val >= 0 else "Blues"))
+                color = "white" if abs(val) > 0.5 * vmax else "black"
+                axs[i + 1, j + 1].text(0, 0, f"{val * 100:.1f}", ha="center", va="center", color=color, fontsize=10)
+                axs[i + 1, j + 1].axis("off")
 
     plt.tight_layout()
 
     plot_dir = "../output_synthetic/pcx/pcx_plots"
-    out_png = os.path.join(plot_dir, f"{layer_name}_class{class_id}_K{K}_proto_concepts.png")
+    suffix = "proto_concepts" if show_proto_concepts else "prototypes_only"
+    out_png = os.path.join(plot_dir, f"{layer_name}_class{class_id}_K{K_plot}_{suffix}.png")
     os.makedirs(os.path.dirname(out_png), exist_ok=True)
     fig_pc.savefig(out_png, dpi=200, bbox_inches="tight")
     plt.close(fig_pc)
-    print(f"➡️ prototype+concept figure: {out_png}")
+    print(f"➡️ prototype figure: {out_png}")
 
 
 def get_detection_crop_exact(model, orig_dataset, ds_idx, box_idx, device,

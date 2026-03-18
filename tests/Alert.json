@@ -47,6 +47,14 @@
     "type": "Property",
     "value": "1dd6022df507af26f9388f2125564767"
 },
+"uav_id": {
+    "type": "Property",
+    "value": "UAV_01"
+},
+"flight_number": {
+    "type": "Property",
+    "value": "2"
+},
 "category": {
     "type": "Property",
     "value": "Met"

@@ -15,7 +15,7 @@ import time
 # Import your existing modules
 from src.explanator import Explanator
 from src.minio_client import MinIOClient, FHHI_MINIO_BUCKET, NAPLES_MINIO_BUCKET
-from common_app_funcs import update_entity, get_bm_id, set_bm_id, set_alert_ref_id , get_alert_ref_id , update_job_status, get_job_status, get_redis_conn, get_job_queue
+from common_app_funcs import update_entity, get_bm_id, set_bm_id,get_uav_id,set_uav_id,get_flight_number,set_flight_number, set_alert_ref_id , get_alert_ref_id , update_job_status, get_job_status, get_redis_conn, get_job_queue
 from tasks import process_image_task
 
 
@@ -232,11 +232,15 @@ def post_data():
         
         # Quick validation check
         if entity_type == "Alert":
+            uav_id = entity["uav_id"]["value"]
+            flight_number = entity["flight_number"]["value"]
             bm_id = entity["bm_id"]["value"]
             alert_ref = entity["alert_ref"]["object"]
+            set_uav_id(redis_conn, uav_id)
+            set_flight_number(redis_conn, flight_number)
             set_bm_id(redis_conn, bm_id)
             set_alert_ref_id(redis_conn, alert_ref)
-            msg = f"Received Alert with bm_id and alert_ref saved to redis: {bm_id}, {alert_ref}"
+            msg = f"Received Alert with bm_id and alert_ref and uav_id and flight_number saved to redis: {bm_id}, {alert_ref}, uav_id: {uav_id}, flight_number: {flight_number}"
             return jsonify({'message': msg}), 200
         
         explanator = get_explanator()
@@ -248,10 +252,36 @@ def post_data():
 
         current_bm_id = get_bm_id(redis_conn)
         current_alert_ref_id = get_alert_ref_id(redis_conn)
+        current_uav_id = get_uav_id(redis_conn)
+        current_flight_number = get_flight_number(redis_conn)   
         app.logger.debug(f"Current alert_ref: {current_alert_ref_id}")
         app.logger.debug(f"Current bm_id: {current_bm_id}")
+        app.logger.debug(f"Current uav_id: {current_uav_id}")
+        app.logger.debug(f"Current flight_number: {current_flight_number}")
 
         # Extract image information
+        posted_uav_id = entity["uav_id"]["value"]
+        if current_uav_id is None:
+            app.logger.info(f"No cached uav_id; storing value {posted_uav_id}.")
+            set_uav_id(redis_conn, posted_uav_id)
+            current_uav_id = posted_uav_id
+        elif posted_uav_id != current_uav_id:
+            app.logger.warning(f"Received uav_id: {posted_uav_id} does not match current uav_id: {current_uav_id}; updating stored uav_id.")
+            set_uav_id(redis_conn, posted_uav_id)
+            current_uav_id = posted_uav_id
+
+        posted_flight_number = entity["flight_number"]["value"]
+        if current_flight_number is None:
+            app.logger.info(f"No cached flight_number; storing value {posted_flight_number}.")
+            set_flight_number(redis_conn, posted_flight_number)
+            current_flight_number = posted_flight_number
+        elif posted_flight_number != current_flight_number:
+            app.logger.warning(f"Received flight_number: {posted_flight_number} does not match current flight_number: {current_flight_number}; updating stored flight_number.")
+            set_flight_number(redis_conn, posted_flight_number)
+            current_flight_number = posted_flight_number
+             
+
+
         posted_bm_id = entity["bm_id"]["value"]
         if current_bm_id is None:
             app.logger.info(f"No cached bm_id; storing value {posted_bm_id}.")
@@ -291,6 +321,8 @@ def post_data():
                 'entity_type': entity_type,
                 'src_image_bucket': src_image_bucket,
                 'minio_filename': src_image_filename,
+                'uav_id': posted_uav_id,
+                'flight_number': posted_flight_number,
                 'bm_id': posted_bm_id,
                 'alert_ref': posted_alert_ref
             }
@@ -303,6 +335,8 @@ def post_data():
                 src_image_bucket,
                 src_image_filename,
                 task_id,
+                uav_id=posted_uav_id,
+                flight_number=posted_flight_number,
                 bm_id=posted_bm_id,
                 alert_ref=posted_alert_ref,
                 job_timeout='12h'  # Set an appropriate timeout
@@ -345,19 +379,26 @@ def post_data_old():
             app.logger.debug(f"Received outer entity type: {outer_entity_type} instead of Notification")
         
         if entity_type == "Alert":
+            uav_id = entity["uav_id"]["value"]
+            flight_number = entity["flight_number"]["value"]
             bm_id = entity["bm_id"]["value"]
             alert_ref = entity["alert_ref"]["value"]
             set_alert_ref_id(redis_conn, alert_ref)
             set_bm_id(redis_conn, bm_id)
+            set_uav_id(redis_conn, uav_id)
+            set_flight_number(redis_conn, flight_number)
             msg = f"Received Alert with bm_id:  {bm_id} and alert_ref: {alert_ref} saved to redis"
             return jsonify({'message': msg}), 200
 
         bm_id = get_bm_id(redis_conn)
+        uav_id = get_uav_id(redis_conn)
+        flight_number = get_flight_number(redis_conn)
         alert_ref = get_alert_ref_id(redis_conn)
         app.logger.debug(f"Current alert_ref: {alert_ref}")
 
         app.logger.debug(f"Current bm_id: {bm_id}")
-
+        app.logger.debug(f"Current uav_id: {uav_id}")
+        app.logger.debug(f"Current flight_number: {flight_number}")
         explanator = get_explanator()
 
         if entity_type not in explanator.VALID_ENTITY_TYPES:

@@ -36,10 +36,19 @@ person_vehicle_detection_explanation_template = {
         "type": "Property",
         "value": None
     },
+    "uav_id": {
+        "type": "Property",
+        "value": None
+    },
+    "flight_number": {
+        "type": "Property",
+        "value": None
+    },
     "alert_ref": {
         "type": "Relationship",
         "object": None
     },
+    
 
     # Comes from the original detection entity
     "original_image": {
@@ -47,6 +56,8 @@ person_vehicle_detection_explanation_template = {
         "value": {
             "bucket": None,
             "filename": None,
+            "uav_id": None,
+            "flight_number": None
         },
     },
     # Comes from the original detection entity
@@ -57,6 +68,7 @@ person_vehicle_detection_explanation_template = {
             "class_categories": None,
         },
     },
+    
     "explanation": {
         "type": "Property",
         "value": {
@@ -83,6 +95,8 @@ def get_person_vehicle_detection_explanation_entity(
     layer,
     mode,
     bm_id,
+    uav_id,
+    flight_number,
     alert_ref,
 ):
     template = copy.deepcopy(person_vehicle_detection_explanation_template)
@@ -91,6 +105,8 @@ def get_person_vehicle_detection_explanation_entity(
 
     template["timestamp"]["value"] = timestamp
     template["bm_id"]["value"] = bm_id
+    template["original_image"]["value"]["uav_id"] = uav_id
+    template["original_image"]["value"]["flight_number"] = flight_number
     template["alert_ref"]["object"] = alert_ref
     template["original_image"]["value"]["bucket"] = original_image_bucket
     template["original_image"]["value"]["filename"] = original_image_filename
@@ -142,6 +158,19 @@ flood_segmentation_explanation_template = {
         "type": "Property",
         "value": None
     },
+    # Comes from the original segmentation entity
+    "original_image": {
+        "type": "Property",
+        "value": {
+            "bucket": None,
+            "filename": None,
+            "uav_id": None,
+            "flight_number": None
+        },
+    },
+    "original_detection": {
+        "type": "Property",
+    },
     "alert_ref": {
         "type": "Relationship",
         "object": None
@@ -153,6 +182,8 @@ flood_segmentation_explanation_template = {
         "value": {
             "bucket": None,
             "filename": None,
+            "uav_id": None,
+            "flight_number": None
         },
     },
     "explanation_image": {
@@ -185,6 +216,8 @@ def get_flood_segmentation_explanation_entity(
     layer,
     mode,
     bm_id,
+    uav_id,
+    flight_number,
     alert_ref,
 ):
     template = copy.deepcopy(flood_segmentation_explanation_template)
@@ -193,6 +226,8 @@ def get_flood_segmentation_explanation_entity(
 
     template["timestamp"]["value"] = timestamp
     template["bm_id"]["value"] = bm_id
+    template["original_image"]["value"]["uav_id"] = uav_id
+    template["original_image"]["value"]["flight_number"] = flight_number
     template["alert_ref"]["object"] = alert_ref
     template["original_image"]["value"]["bucket"] = original_image_bucket
     template["original_image"]["value"]["filename"] = original_image_filename

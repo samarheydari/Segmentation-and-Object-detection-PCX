@@ -3,6 +3,7 @@ import sys
 import gc
 import time
 import copy
+import shutil
 import logging
 
 import matplotlib.pyplot as plt
@@ -238,6 +239,137 @@ def _run_attr_cpu(model, attribution_cls, composite, img_or_batch, *,
     return _with_model_on_cpu(model, _do)
 
 
+def _layer_candidates(layer: str, model_name: str):
+    candidates = [layer]
+    if model_name == "pidnet":
+        heads = ("final_layer", "seghead_p", "seghead_d")
+        for h in heads:
+            if layer.startswith(f"{h}.sequential."):
+                candidates.append(layer.replace(f"{h}.sequential.", f"{h}.", 1))
+            elif layer.startswith(f"{h}."):
+                candidates.append(layer.replace(f"{h}.", f"{h}.sequential.", 1))
+    out, seen = [], set()
+    for c in candidates:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+
+def _resolve_recorded_layer(attr, requested_layer: str, model_name: str):
+    keys = set(attr.activations.keys()) | set(attr.relevances.keys())
+    for cand in _layer_candidates(requested_layer, model_name):
+        if cand in keys:
+            return cand
+
+    # fallback by head + leaf name
+    req_parts = requested_layer.split(".")
+    req_head = req_parts[0] if req_parts else ""
+    req_leaf = req_parts[-1] if req_parts else ""
+    for k in sorted(keys):
+        parts = k.split(".")
+        if parts and parts[0] == req_head and parts[-1] == req_leaf:
+            return k
+    return None
+
+
+def _resolve_saved_stats_layer(output_dir: str, layer: str, mode: str, model_name: str):
+    """
+    Resolve to a layer key that actually has saved CRP stats on disk.
+    """
+    max_dir = "ActMax_max_normed" if mode == "activation" else "RelMax_sum_normed"
+
+    def has_stats(name: str) -> bool:
+        p = os.path.join(output_dir, max_dir, f"{name}_data.npy")
+        return os.path.exists(p)
+
+    for cand in _layer_candidates(layer, model_name):
+        if has_stats(cand):
+            return cand
+
+    # fallback by matching head + leaf (e.g. final_layer + conv1)
+    req = layer.split(".")
+    req_head = req[0] if req else ""
+    req_leaf = req[-1] if req else ""
+    stats_root = os.path.join(output_dir, max_dir)
+    if os.path.isdir(stats_root):
+        for fname in os.listdir(stats_root):
+            if not fname.endswith("_data.npy"):
+                continue
+            name = fname[:-len("_data.npy")]
+            parts = name.split(".")
+            if parts and parts[0] == req_head and parts[-1] == req_leaf:
+                return name
+    return layer
+
+
+def _ensure_max_stats_alias(output_dir: str, mode: str, src_layer: str, dst_layer: str):
+    if src_layer == dst_layer:
+        return
+    max_dir = "ActMax_max_normed" if mode == "activation" else "RelMax_sum_normed"
+    base = os.path.join(output_dir, max_dir)
+    os.makedirs(base, exist_ok=True)
+    for suf in ("_data.npy", "_rel.npy", "_rf.npy"):
+        src = os.path.join(base, f"{src_layer}{suf}")
+        dst = os.path.join(base, f"{dst_layer}{suf}")
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.copyfile(src, dst)
+
+
+def _ref_to_chw_float01(ref_img):
+    # Accept PIL / numpy / torch and normalize to CHW float in [0,1].
+    if torch.is_tensor(ref_img):
+        t = ref_img.detach().cpu().float()
+        if t.ndim == 2:
+            t = t.unsqueeze(0).repeat(3, 1, 1)
+        elif t.ndim == 3:
+            # CHW: small first dim
+            if t.shape[0] in (1, 3, 4):
+                if t.shape[0] == 1:
+                    t = t.repeat(3, 1, 1)
+                elif t.shape[0] >= 3:
+                    t = t[:3]
+            # HWC: small last dim
+            elif t.shape[-1] in (1, 3, 4):
+                t = t.permute(2, 0, 1)
+                if t.shape[0] == 1:
+                    t = t.repeat(3, 1, 1)
+                elif t.shape[0] >= 3:
+                    t = t[:3]
+            else:
+                t = torch.zeros((3, 150, 150), dtype=torch.float32)
+        else:
+            t = torch.zeros((3, 150, 150), dtype=torch.float32)
+    else:
+        arr = np.array(ref_img)
+        if arr.ndim == 2:
+            arr = np.repeat(arr[..., None], 3, axis=2)  # HWC gray -> RGB
+            t = torch.from_numpy(arr).permute(2, 0, 1).float()
+        elif arr.ndim == 3:
+            # HWC
+            if arr.shape[2] in (1, 3, 4):
+                if arr.shape[2] == 1:
+                    arr = np.repeat(arr, 3, axis=2)
+                else:
+                    arr = arr[..., :3]
+                t = torch.from_numpy(arr).permute(2, 0, 1).float()
+            # CHW
+            elif arr.shape[0] in (1, 3, 4):
+                if arr.shape[0] == 1:
+                    arr = np.repeat(arr, 3, axis=0)
+                else:
+                    arr = arr[:3]
+                t = torch.from_numpy(arr).float()
+            else:
+                t = torch.zeros((3, 150, 150), dtype=torch.float32)
+        else:
+            t = torch.zeros((3, 150, 150), dtype=torch.float32)
+
+    if t.max() > 1.0:
+        t = t / 255.0
+    return t.clamp(0.0, 1.0)
+
+
 def plot_one_image_explanation_optimized(model_name, model, img, dataset, class_id, layer, prediction_num, mode,
                                          n_concepts, n_refimgs, output_dir):
     # --- device & model state ---
@@ -295,12 +427,22 @@ def plot_one_image_explanation_optimized(model_name, model, img, dataset, class_
     # -------------------------
     if "deeplab" in model_name or "unet" in model_name or "pidnet" in model_name:
         log_memory("BEFORE SEGMENTATION ATTR")
+        record_layers = _layer_candidates(layer, model_name)
 
         # Run attribution on CPU to avoid canonizer device mismatch
         attr = _run_attr_cpu(
             model, ATTRIBUTORS[model_name], composite,
-            img, condition=condition, record_layer=[layer], init_rel=1
+            img, condition=condition, record_layer=record_layers, init_rel=1
         )
+        resolved_layer = _resolve_recorded_layer(attr, layer, model_name)
+        if resolved_layer is None:
+            available = sorted(set(attr.activations.keys()) | set(attr.relevances.keys()))
+            raise KeyError(
+                f"Layer '{layer}' not found in recorded layers. "
+                f"Try one of: {available[:20]}{' ...' if len(available) > 20 else ''}"
+            )
+        if resolved_layer != layer:
+            print(f"[plot_explanations] remapped layer '{layer}' -> '{resolved_layer}'")
 
         log_memory("AFTER SEGMENTATION ATTR")
 
@@ -351,12 +493,22 @@ def plot_one_image_explanation_optimized(model_name, model, img, dataset, class_
     # -------------------------
     elif "yolo" in model_name or "ssd" in model_name:
         log_memory("BEFORE DETECTION ATTR")
+        record_layers = _layer_candidates(layer, model_name)
 
         # Attribution on CPU (canonizers happy)
         attr = _run_attr_cpu(
             model, ATTRIBUTORS[model_name], composite,
-            img, condition=condition, record_layer=[layer], init_rel=1, take_prediction=prediction_num
+            img, condition=condition, record_layer=record_layers, init_rel=1, take_prediction=prediction_num
         )
+        resolved_layer = _resolve_recorded_layer(attr, layer, model_name)
+        if resolved_layer is None:
+            available = sorted(set(attr.activations.keys()) | set(attr.relevances.keys()))
+            raise KeyError(
+                f"Layer '{layer}' not found in recorded layers. "
+                f"Try one of: {available[:20]}{' ...' if len(available) > 20 else ''}"
+            )
+        if resolved_layer != layer:
+            print(f"[plot_explanations] remapped layer '{layer}' -> '{resolved_layer}'")
 
         log_memory("AFTER DETECTION ATTR")
 
@@ -408,9 +560,9 @@ def plot_one_image_explanation_optimized(model_name, model, img, dataset, class_
 
     # === Channel relevance ===
     if mode == "relevance":
-        channel_rels = ChannelConcept().attribute(attr.relevances[layer], abs_norm=True)
+        channel_rels = ChannelConcept().attribute(attr.relevances[resolved_layer], abs_norm=True)
     else:
-        channel_rels = attr.activations[layer].detach().cpu().flatten(start_dim=2).max(2)[0]
+        channel_rels = attr.activations[resolved_layer].detach().cpu().flatten(start_dim=2).max(2)[0]
         channel_rels = channel_rels / channel_rels.abs().sum(1)[:, None]
 
     # === Top concepts ===
@@ -423,20 +575,20 @@ def plot_one_image_explanation_optimized(model_name, model, img, dataset, class_
     attribution_start_ts = time.time()
 
     # === Conditional heatmaps ===
-    conditions = [{"y": class_id, layer: c} for c in topk_ind]
+    conditions = [{"y": class_id, resolved_layer: c} for c in topk_ind]
     if mode == "relevance":
         log_memory("BEFORE CONDITIONAL HEATMAPS")
 
         # Second attribution also on CPU; pass record_layer=[layer]
         cond_heatmap, _, _, _ = _run_attr_cpu(
             model, ATTRIBUTORS[model_name], composite,
-            img, conditions=conditions, record_layer=[layer], init_rel=1,
+            img, conditions=conditions, record_layer=[resolved_layer], init_rel=1,
             exclude_parallel=True, take_prediction=prediction_num
         )
 
         log_memory("AFTER CONDITIONAL HEATMAPS")
     else:
-        cond_heatmap = torch.stack([attr.activations[layer][0][t] for t in topk_ind]).detach().cpu()
+        cond_heatmap = torch.stack([attr.activations[resolved_layer][0][t] for t in topk_ind]).detach().cpu()
 
     logger.debug(f"Time to compute conditional heatmaps: {time.time() - attribution_start_ts:.2f}s")
 
@@ -444,6 +596,10 @@ def plot_one_image_explanation_optimized(model_name, model, img, dataset, class_
     print("Computing reference images...")
     log_memory("BEFORE REF IMAGES")
     ref_images_start_ts = time.time()
+    stats_layer = _resolve_saved_stats_layer(output_dir, resolved_layer, mode, model_name)
+    if stats_layer != resolved_layer:
+        print(f"[plot_explanations] remapped stats layer '{resolved_layer}' -> '{stats_layer}'")
+        _ensure_max_stats_alias(output_dir, mode, stats_layer, resolved_layer)
 
     def _get_refs_cpu():
         # Build a CPU attribution and FV object bound to CPU
@@ -452,11 +608,28 @@ def plot_one_image_explanation_optimized(model_name, model, img, dataset, class_
             attribution_cpu, dataset, get_layer_names(model, [torch.nn.Conv2d]),
             preprocess_fn=lambda x: x, path=output_dir, max_target="max", device="cpu"
         )
-        # Call get_max_reference on CPU
-        return fv_cpu.get_max_reference(
-            topk_ind, layer, mode, (0, n_refimgs), composite=composite, rf=True,
-            plot_fn=vis_opaque_img_border, batch_size=2
-        )
+        # Some PIDNet head layers can fail in RF mode due missing grad hooks.
+        try:
+            return fv_cpu.get_max_reference(
+                topk_ind, resolved_layer, mode, (0, n_refimgs), composite=composite, rf=True,
+                plot_fn=vis_opaque_img_border, batch_size=2
+            )
+        except Exception as e:
+            msg = str(e)
+            if isinstance(e, KeyError) and "grad_output" not in msg:
+                raise
+            print(f"[plot_explanations] RF refs failed on layer '{resolved_layer}' ({e}); retrying with rf=False")
+            try:
+                return fv_cpu.get_max_reference(
+                    topk_ind, resolved_layer, mode, (0, n_refimgs), composite=composite, rf=False,
+                    plot_fn=vis_opaque_img_border, batch_size=2
+                )
+            except Exception as e2:
+                print(f"[plot_explanations] rf=False with composite also failed ({e2}); retrying without composite")
+                return fv_cpu.get_max_reference(
+                    topk_ind, resolved_layer, mode, (0, n_refimgs), composite=None, rf=False,
+                    plot_fn=vis_opaque_img_border, batch_size=2
+                )
 
     ref_imgs = _with_model_on_cpu(model, _get_refs_cpu)
 
@@ -519,14 +692,17 @@ def plot_one_image_explanation_optimized(model_name, model, img, dataset, class_
 
                 if ref_imgs and topk_ind[concept_idx] in ref_imgs:
                     resized_refs = []
+                    grid = None
                     for i in ref_imgs[topk_ind[concept_idx]]:
-                        img_tensor = resize(torch.from_numpy(np.array(i)).permute((2, 0, 1)))
+                        img_tensor = resize(_ref_to_chw_float01(i))
                         resized_refs.append(img_tensor)
 
-                    grid = make_grid(resized_refs, nrow=int(max(1, n_refimgs // 2)), padding=0)
-                    grid = np.array(zimage.imgify(grid.detach().cpu()))
-                    ax.imshow(grid)
-                    ax.yaxis.set_label_position("right")
+                    if len(resized_refs) > 0:
+                        grid = make_grid(resized_refs, nrow=int(max(1, n_refimgs // 2)), padding=0)
+                        grid = grid.detach().cpu().permute(1, 2, 0).numpy()
+                        grid = np.clip(grid, 0.0, 1.0)
+                        ax.imshow(grid)
+                        ax.yaxis.set_label_position("right")
 
                     del resized_refs, grid
                     gc.collect()

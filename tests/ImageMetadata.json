@@ -23,6 +23,14 @@
         "type": "Property",
         "value": "2fa4e1f4dbbe86744898e2d51ebed567"
       },
+      "uav_id": {
+        "type": "Property",
+        "value": "UAV_01"
+      },
+      "flight_number": {
+        "type": "Property",
+        "value": "2"
+      },
       "alert_ref": {
         "type": "Relationship",
         "object": "urn:ngsi-ld:tema:kamk:sv07:alert:brk:111"
@@ -41,7 +49,7 @@
       },
       "filename": {
         "type": "Property",
-        "value": "sv01/a6be75af1b9b5ba7d102971f4f8048ec/2/DJI_20211023132215_0099_Z.JPG"
+        "value": "sv01/ece2fb042da0dfa1de0f98b171e0e013/1/DJI_20211023132249_0108_W.JPG"
       },
       "gimbal_parameters": {
         "type": "Property",
@@ -53,7 +61,7 @@
       },
       "minio_url": {
         "type": "Property",
-        "value": "https://storage.tema.digital-enabler.eng.it:443/use/sv01/a6be75af1b9b5ba7d102971f4f8048ec/2/DJI_20211023132215_0099_Z.JPG"
+        "value": "https://storage.tema.digital-enabler.eng.it:443/use/sv01/ece2fb042da0dfa1de0f98b171e0e013/1/DJI_20211023132249_0108_W.JPG"
       }
     }
   ]

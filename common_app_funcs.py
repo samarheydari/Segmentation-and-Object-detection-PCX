@@ -12,6 +12,23 @@ def get_bm_id(redis_conn):
     bm_id = redis_conn.get('current_bm_id')
     return bm_id.decode('utf-8') if bm_id else None
 
+def set_uav_id(redis_conn, uav_id):
+    redis_conn.set('current_uav_id', uav_id)
+
+def get_uav_id(redis_conn):
+    uav_id = redis_conn.get('current_uav_id')
+    return uav_id.decode('utf-8') if uav_id else None
+
+
+def set_flight_number(redis_conn, flight_number):
+    redis_conn.set('current_flight_number', flight_number)
+
+def get_flight_number(redis_conn):
+    flight_number = redis_conn.get('current_flight_number')
+    return flight_number.decode('utf-8') if flight_number else None
+
+
+
 def set_alert_ref_id(redis_conn, alert_ref):
     redis_conn.set('current_alert_ref_id', alert_ref)
 

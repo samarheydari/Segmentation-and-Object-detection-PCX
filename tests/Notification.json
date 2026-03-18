@@ -4,6 +4,8 @@
     "subscriptionId": "urn:ngsi-ld:Subscription:tfa02:001",
     "notifiedAt": "2025-03-19T12:05:33.291Z",
     "bm_id": "test_bm",
+    "uav_id": "UAV_01",
+    "flight_number": "2",
     "alert_ref": "urn:ngsi-ld:tema:kamk:sv07:alert:test:dmalian:25092025:112",
     "data": [
         {
@@ -156,6 +158,7 @@
                 "type": "Property",
                 "value": {
                     "mask_id": "Flood_DJI_20211023132023_0071_W.png"
+                    
                 }
             },
             "bucket": {

@@ -4,6 +4,7 @@ import gc
 import time
 import h5py
 import copy
+import shutil
 import logging
 from typing import Dict, List, Tuple, Optional
 
@@ -34,11 +35,179 @@ logging.disable(logging.ERROR)
 # -------------------------
 # Small helpers
 # -------------------------
+def _layer_candidates(layer: str):
+    cands = [layer]
+    heads = ("final_layer", "seghead_p", "seghead_d")
+    for h in heads:
+        if layer.startswith(f"{h}.sequential."):
+            cands.append(layer.replace(f"{h}.sequential.", f"{h}.", 1))
+        elif layer.startswith(f"{h}."):
+            cands.append(layer.replace(f"{h}.", f"{h}.sequential.", 1))
+    out, seen = [], set()
+    for c in cands:
+        if c not in seen:
+            out.append(c)
+            seen.add(c)
+    return out
+
+
+def _resolve_attr_layer(attr, requested_layer: str):
+    keys = set(attr.relevances.keys()) | set(attr.activations.keys())
+    for cand in _layer_candidates(requested_layer):
+        if cand in keys:
+            return cand
+    return requested_layer
+
+
+def _resolve_pcx_attr_path(output_dir_pcx: str, layer: str):
+    for cand in _layer_candidates(layer):
+        p = os.path.join(output_dir_pcx, cand, "attributions.npy")
+        if os.path.exists(p):
+            return cand, p
+    return layer, os.path.join(output_dir_pcx, layer, "attributions.npy")
+
+
+def _resolve_crp_relmax_layer(output_dir_crp: str, layer: str):
+    for cand in _layer_candidates(layer):
+        p = os.path.join(output_dir_crp, "RelMax_sum_normed", f"{cand}_data.npy")
+        if os.path.exists(p):
+            return cand, p
+    return layer, os.path.join(output_dir_crp, "RelMax_sum_normed", f"{layer}_data.npy")
+
+
+def _ensure_crp_relmax_alias(output_dir_crp: str, src_layer: str, dst_layer: str):
+    if src_layer == dst_layer:
+        return
+    base = os.path.join(output_dir_crp, "RelMax_sum_normed")
+    os.makedirs(base, exist_ok=True)
+    for suf in ("_data.npy", "_rel.npy", "_rf.npy"):
+        src = os.path.join(base, f"{src_layer}{suf}")
+        dst = os.path.join(base, f"{dst_layer}{suf}")
+        if os.path.exists(src) and not os.path.exists(dst):
+            shutil.copyfile(src, dst)
+
+
 def _as_uint8_array(image: Image.Image) -> np.ndarray:
     arr = np.array(image)
     if arr.dtype != np.uint8:
         arr = np.clip(arr, 0, 255).astype(np.uint8)
     return arr
+
+
+def _show_message_box(
+    ax: plt.Axes,
+    message: str,
+    facecolor: str = "#eef2ff",
+    edgecolor: str = "#1f3fff",
+    textcolor: str = "#1f3fff",
+) -> None:
+    ax.imshow(np.ones((150, 150, 3), dtype=np.float32))
+    rect = patches.Rectangle((0, 0), 149, 149, linewidth=2.5, edgecolor=edgecolor, facecolor=facecolor, alpha=0.95)
+    ax.add_patch(rect)
+    ax.text(
+        75, 75, message,
+        ha="center", va="center",
+        fontsize=9, color=textcolor, fontweight="bold",
+        wrap=True
+    )
+    ax.set_xlim([0, 150])
+    ax.set_ylim([149, 0])
+    ax.set_xticks([])
+    ax.set_yticks([])
+
+
+def _select_diverse_concepts(
+    channel_rels_vec: torch.Tensor,
+    attributions_np: np.ndarray,
+    max_concepts: int = 4,
+    candidate_pool: int = 12,
+    corr_penalty: float = 0.35,
+    corr_skip_threshold: float = 0.92,
+) -> Tuple[np.ndarray, np.ndarray]:
+    rels = np.asarray(channel_rels_vec.detach().cpu(), dtype=np.float32).reshape(-1)
+    if rels.size == 0:
+        return np.array([], dtype=int), np.array([], dtype=np.float32)
+
+    max_concepts = max(1, min(int(max_concepts), rels.size))
+    ranked = np.argsort(-rels)
+    pool = ranked[: min(max(candidate_pool, max_concepts), ranked.size)]
+    if pool.size <= max_concepts or attributions_np.ndim != 2 or attributions_np.shape[0] < 2:
+        chosen = pool[:max_concepts]
+        return chosen.astype(int), rels[chosen]
+
+    bank = np.nan_to_num(attributions_np[:, pool], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+    bank -= bank.mean(axis=0, keepdims=True)
+    bank_std = bank.std(axis=0, keepdims=True)
+    bank_std[bank_std < 1e-8] = 1.0
+    bank /= bank_std
+    corr = np.abs(np.corrcoef(bank, rowvar=False))
+    corr = np.nan_to_num(corr, nan=0.0)
+
+    chosen_pos = [0]
+    remaining = list(range(1, pool.size))
+    while remaining and len(chosen_pos) < max_concepts:
+        best_pos = None
+        best_score = -np.inf
+        slots_left = max_concepts - len(chosen_pos)
+        for pos in remaining:
+            max_corr = float(corr[pos, chosen_pos].max()) if chosen_pos else 0.0
+            if max_corr >= corr_skip_threshold and len(remaining) > slots_left:
+                continue
+            score = float(rels[pool[pos]]) - corr_penalty * max_corr
+            if score > best_score:
+                best_score = score
+                best_pos = pos
+        if best_pos is None:
+            best_pos = remaining[0]
+        chosen_pos.append(best_pos)
+        remaining.remove(best_pos)
+
+    chosen = pool[np.array(chosen_pos[:max_concepts], dtype=int)]
+    order = np.argsort(-rels[chosen])
+    chosen = chosen[order]
+    return chosen.astype(int), rels[chosen]
+
+
+def _select_diverse_reference_images(
+    images: List[Image.Image],
+    limit: int,
+    hash_size: int = 24,
+    duplicate_threshold: float = 2.0,
+) -> List[Image.Image]:
+    if limit <= 0 or not images:
+        return []
+
+    selected: List[Image.Image] = []
+    fingerprints: List[np.ndarray] = []
+    for image in images:
+        arr = np.asarray(image.resize((hash_size, hash_size), Image.BILINEAR), dtype=np.float32)
+        if arr.ndim == 3:
+            arr = arr.mean(axis=2)
+        arr -= arr.mean()
+        norm = np.linalg.norm(arr)
+        if norm > 1e-8:
+            arr /= norm
+
+        is_duplicate = False
+        for prev in fingerprints:
+            if np.linalg.norm(arr - prev) <= duplicate_threshold / hash_size:
+                is_duplicate = True
+                break
+
+        if not is_duplicate:
+            selected.append(image)
+            fingerprints.append(arr)
+        if len(selected) >= limit:
+            break
+
+    if len(selected) < min(limit, len(images)):
+        for image in images:
+            if len(selected) >= limit:
+                break
+            if all(image is not chosen for chosen in selected):
+                selected.append(image)
+
+    return selected[:limit]
 
 # -------------------------
 # Reference images cache (HDF5)
@@ -135,7 +304,8 @@ def plot_pcx_explanations(
     num_prototypes: int,
     ref_imgs_path: str,
     output_dir_crp: str,
-    output_dir_pcx: str):
+    output_dir_pcx: str,
+    concept_ids: Optional[List[int]] = None):
     print("[plot_pcx_explanations] starting")
     img, target = dataset[sample_id]
     print(f"[plot_pcx_explanations] sample_id={sample_id} img.shape={tuple(img.shape)}")
@@ -153,6 +323,7 @@ def plot_pcx_explanations(
         ref_imgs_path=ref_imgs_path,
         output_dir_crp=output_dir_crp,
         output_dir_pcx=output_dir_pcx,
+        concept_ids=concept_ids,
     )
 
     print("[plot_pcx_explanations] finished")
@@ -171,6 +342,7 @@ def plot_one_image_pcx_explanation(
     ref_imgs_path: str,
     output_dir_crp: str,
     output_dir_pcx: str,
+    concept_ids: Optional[List[int]] = None,
 ) -> plt.Figure:
     t_start = time.time()
     device = "cpu"  # keep CPU for sklearn compatibility
@@ -196,7 +368,14 @@ def plot_one_image_pcx_explanation(
     # Attribution on the chosen sample
     print("[attr] computing base attribution")
     x_copy = copy.deepcopy(x).requires_grad_()
-    attr = attribution(x_copy, condition, composite, record_layer=[layer], init_rel=1)
+    attr = attribution(x_copy, condition, composite, record_layer=_layer_candidates(layer), init_rel=1)
+    resolved_layer = _resolve_attr_layer(attr, layer)  # key available in attr.{relevances,activations}
+    if resolved_layer != layer:
+        print(f"[attr] remapped layer '{layer}' -> '{resolved_layer}'")
+    # model-valid key for future conditional attributions/hooks
+    runtime_layer = next((c for c in _layer_candidates(resolved_layer) if c in layer_map), resolved_layer)
+    if runtime_layer != resolved_layer:
+        print(f"[attr] using runtime layer '{runtime_layer}' for conditional attribution hooks")
 
     # Heatmap
     heatmap_pil = zimage.imgify(attr.heatmap.detach().cpu(), cmap="bwr", symmetric=True, level=10)
@@ -226,34 +405,19 @@ def plot_one_image_pcx_explanation(
 
     # Channel relevances
     print("[concepts] computing channel relevances")
-    channel_rels = ChannelConcept().attribute(attr.relevances[layer], abs_norm=True)  # [1,C]
+    channel_rels = ChannelConcept().attribute(attr.relevances[resolved_layer], abs_norm=True)  # [1,C]
     channel_rels_vec = channel_rels[0]  # [C]
     print(f"[concepts] channel_rels shape={tuple(channel_rels.shape)}")
 
-    # Top-k concepts
-    topk = torch.topk(channel_rels_vec, k=n_concepts)
-    topk_ind = topk.indices.detach().cpu().numpy()
-    topk_rel = topk.values.detach().cpu().numpy()
-    print(f"[concepts] topk_ind={topk_ind.tolist()} topk_rel={np.round(topk_rel,3).tolist()}")
-
-    # Conditional heatmaps per concept
-    conditions = [{"y": 1, layer: int(c)} for c in topk_ind]
-    print("[attr] computing conditional heatmaps")
-    attribution.take_prediction = 0
-    cond_heatmaps, _, _, _ = attribution(x.requires_grad_(), conditions, composite, exclude_parallel=True)
-    attribution.take_prediction = 0
-
-    # Reference images
-    print("[refs] computing/loading reference images")
-    ref_imgs = get_ref_images(
-        fv=fv, topk_ind=topk_ind, layer_name=layer,
-        composite=composite, n_ref=n_refimgs, ref_imgs_save_path=ref_imgs_path
-    )
-
     # Load attributions matrix for GMM
-    attr_path = os.path.join(output_dir_pcx, layer, "attributions.npy")
+    resolved_pcx_layer, attr_path = _resolve_pcx_attr_path(output_dir_pcx, resolved_layer)
     if not os.path.exists(attr_path):
-        raise FileNotFoundError(f"Attributions file not found: {attr_path}")
+        raise FileNotFoundError(
+            f"Attributions file not found for layer '{resolved_layer}'. "
+            f"Tried: {[os.path.join(output_dir_pcx, c, 'attributions.npy') for c in _layer_candidates(resolved_layer)]}"
+        )
+    if resolved_pcx_layer != resolved_layer:
+        print(f"[gmm] remapped PCX layer '{resolved_layer}' -> '{resolved_pcx_layer}'")
     print(f"[gmm] loading attributions @ {attr_path}")
     attributions_np = np.load(attr_path)  # shape [N, C]
     print(f"[gmm] attributions shape={attributions_np.shape}")
@@ -278,6 +442,56 @@ def plot_one_image_pcx_explanation(
         dropped = int((~nonzero_mask).sum())
         print(f"[gmm] INFO: dropping {dropped} constant rows from attribution bank.")
         attributions_np = attributions_np[nonzero_mask]
+
+    # Diverse top concepts
+    num_ch = int(channel_rels_vec.numel())
+    max_display_concepts = max(1, min(int(n_concepts), num_ch))
+    if num_ch <= 0:
+        raise ValueError(f"[concepts] No channels available for layer '{resolved_layer}'.")
+    if concept_ids is not None:
+        requested = np.asarray(concept_ids, dtype=int).reshape(-1)
+        requested = requested[(requested >= 0) & (requested < num_ch)]
+        if requested.size == 0:
+            raise ValueError("[concepts] Provided concept_ids are invalid for this layer.")
+        topk_ind = requested[:max_display_concepts]
+        topk_rel = channel_rels_vec.detach().cpu().numpy()[topk_ind]
+        print(f"[concepts] using explicit concept_ids={topk_ind.tolist()}")
+    else:
+        topk_ind, topk_rel = _select_diverse_concepts(
+            channel_rels_vec=channel_rels_vec,
+            attributions_np=attributions_np,
+            max_concepts=min(max_display_concepts, num_ch),
+            candidate_pool=max(10, max_display_concepts * 3),
+        )
+    n_display_concepts = int(len(topk_ind))
+    print(f"[concepts] selected_ind={topk_ind.tolist()} selected_rel={np.round(topk_rel,3).tolist()}")
+
+    # Conditional heatmaps per concept
+    conditions = [{"y": 1, runtime_layer: int(c)} for c in topk_ind]
+    print("[attr] computing conditional heatmaps")
+    attribution.take_prediction = 0
+    cond_heatmaps, _, _, _ = attribution(
+        x.requires_grad_(), conditions, composite, record_layer=[runtime_layer], exclude_parallel=True
+    )
+    attribution.take_prediction = 0
+
+    # Reference images
+    print("[refs] computing/loading reference images")
+    resolved_ref_layer, relmax_path = _resolve_crp_relmax_layer(output_dir_crp, resolved_layer)
+    if resolved_ref_layer != runtime_layer:
+        print(f"[refs] remapped CRP layer '{runtime_layer}' -> '{resolved_ref_layer}'")
+        _ensure_crp_relmax_alias(output_dir_crp, resolved_ref_layer, runtime_layer)
+        resolved_ref_layer = runtime_layer
+        relmax_path = os.path.join(output_dir_crp, "RelMax_sum_normed", f"{runtime_layer}_data.npy")
+    if not os.path.exists(relmax_path):
+        raise FileNotFoundError(
+            f"CRP RelMax file not found for layer '{runtime_layer}'. "
+            f"Tried: {[os.path.join(output_dir_crp, 'RelMax_sum_normed', f'{c}_data.npy') for c in _layer_candidates(runtime_layer)]}"
+        )
+    ref_imgs = get_ref_images(
+        fv=fv, topk_ind=topk_ind, layer_name=resolved_ref_layer,
+        composite=composite, n_ref=n_refimgs, ref_imgs_save_path=ref_imgs_path
+    )
 
     # Fit fresh GMMs each run so prototype selection adapts to current statistics
     print("[gmm] fitting GMM for current run")
@@ -324,7 +538,7 @@ def plot_one_image_pcx_explanation(
     data_p, _ = dataset[closest_idx]
     data_p = data_p.to(device)[None]
     print("[proto] computing prototype attributions")
-    attr_p = attribution(data_p.requires_grad_(), [{"y": 1}], composite, record_layer=[layer])
+    attr_p = attribution(data_p.requires_grad_(), [{"y": 1}], composite, record_layer=[runtime_layer])
     cond_heatmap_p, _, _, _ = attribution(data_p.requires_grad_(), conditions, composite)
     proto_heatmap_pil = zimage.imgify(attr_p.heatmap, cmap="bwr", symmetric=True, level=10)
 
@@ -348,18 +562,23 @@ def plot_one_image_pcx_explanation(
     # Plotting
     # -------------------------
     print("[plot] assembling figure")
-    n_rows = max(n_concepts, 4)
-    width_ratios = [1, 1, n_refimgs / 4 if n_refimgs else 1, 1, 1, 1]
+    n_rows = max(n_display_concepts, 4)
+    concept_grid_cols = max(1, int(n_refimgs))
+    concept_tile_size = 150
+    concept_col_width = max(3.2, float(n_refimgs))
+    width_ratios = [1.0, 1.0, concept_col_width, 1.05, 1.05, 1.0]
 
     fig, axs = plt.subplots(
         n_rows, 6,
-        figsize=(4 * max(1, n_refimgs / 4), 1.8 * n_rows),
-        gridspec_kw={'width_ratios': width_ratios},
+        figsize=(14.5 + 1.2 * max(0, n_refimgs - 3), 2.15 * n_rows),
+        gridspec_kw={'width_ratios': width_ratios, 'wspace': 0.12, 'hspace': 0.34},
+        facecolor="white",
         dpi=200
     )
 
     # Resize for plotting
     resize = torchvision.transforms.Resize((150, 150))
+    resize_concept = torchvision.transforms.Resize((concept_tile_size, concept_tile_size))
 
     img_in_res = resize(img_in_overlay)
     base_heatmap_res = resize(heatmap_pil)
@@ -368,25 +587,43 @@ def plot_one_image_pcx_explanation(
 
     # Percentile for outlier flag
     p1 = np.percentile(scores, 1)
+    flood_segment_ratio = float(mask_resized.float().mean().item())
+    flood_segment_too_small = flood_segment_ratio < 0.005  # <0.5% of pixels predicted as flood
+    flood_segment_ratio_proto = float(mask_p_resized.float().mean().item())
+    flood_segment_too_small_proto = flood_segment_ratio_proto < 0.005  # <0.5% of pixels predicted as flood
+    relevance_too_small_thr = 1e-3  # 0.1%
+    print(
+        f"[plot] flood_segment_ratio={flood_segment_ratio:.6f}, "
+        f"flood_segment_ratio_proto={flood_segment_ratio_proto:.6f}, "
+        f"flood_segment_too_small={flood_segment_too_small}, "
+        f"flood_segment_too_small_proto={flood_segment_too_small_proto}, "
+        f"relevance_too_small_thr={relevance_too_small_thr:.6f}"
+    )
 
     for r, row_axs in enumerate(axs):
         for c, ax in enumerate(row_axs):
             ax.set_xticks([]); ax.set_yticks([])
 
             # If r exceeds actual concepts, hide the row
-            if r >= n_concepts and c not in (0,):
+            if r >= n_display_concepts and c not in (0,):
                 ax.axis("off")
                 continue
 
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+
             if c == 0:
                 if r == 0:
-                    ax.set_title("input")
+                    ax.set_title("input", fontsize=12, pad=8)
                     ax.imshow(img_in_res.permute(1, 2, 0).cpu().numpy())
                 elif r == 1:
-                    ax.set_title("heatmap")
-                    ax.imshow(base_heatmap_res)
+                    ax.set_title("heatmap", fontsize=12, pad=8)
+                    if flood_segment_too_small:
+                        _show_message_box(ax, "Flood segment\nis too small")
+                    else:
+                        ax.imshow(base_heatmap_res)
                 elif r == 2:
-                    ax.set_title("class likelihood")
+                    ax.set_title("class likelihood", fontsize=12, pad=8)
                     h = ax.hist(scores, bins=20, color='k')
                     ax.vlines(score_sample, 0, (h[0].max() if len(h[0]) else 1), linestyle='--', linewidth=3, label="sample")
                     ax.legend()
@@ -405,68 +642,94 @@ def plot_one_image_pcx_explanation(
 
             elif c == 1:
                 if r == 0:
-                    ax.set_title("cond. heatmap")
+                    ax.set_title("cond. heatmap", fontsize=12, pad=8)
                 # cond heatmap for r-th concept
-                hm_pil = zimage.imgify(cond_heatmaps[r], symmetric=True, cmap="bwr", level=10)
-                hm_res = resize(hm_pil)
-                ax.imshow(hm_res)
-                ax.set_ylabel(f"concept {topk_ind[r]}\n relevance: {(topk_rel[r] * 100):.1f}%")
+                concept_rel = float(topk_rel[r])
+                if concept_rel <= relevance_too_small_thr:
+                    _show_message_box(ax, "Relevance is\ntoo small")
+                else:
+                    hm_pil = zimage.imgify(cond_heatmaps[r], symmetric=True, cmap="bwr", level=10)
+                    hm_res = resize(hm_pil)
+                    ax.imshow(hm_res)
+                ax.set_ylabel(f"concept {topk_ind[r]}\n{(topk_rel[r] * 100):.1f}%", fontsize=10, labelpad=8)
 
             elif c == 2:
                 if r == 0:
-                    ax.set_title("concept visualizations")
+                    ax.set_title("concept visualizations", fontsize=12, pad=8)
                 # Show reference images grid for concept r
                 if ref_imgs and int(topk_ind[r]) in ref_imgs and len(ref_imgs[int(topk_ind[r])]) > 0:
+                    concept_images = _select_diverse_reference_images(ref_imgs[int(topk_ind[r])], n_refimgs)
                     resized_refs = []
-                    for im in ref_imgs[int(topk_ind[r])][:n_refimgs]:
+                    for im in concept_images:
                         # Convert PIL -> Tensor [C,H,W]
-                        t = TF.pil_to_tensor(resize(im))
+                        t = TF.pil_to_tensor(resize_concept(im))
                         resized_refs.append(t)
                     if resized_refs:
-                        grid = make_grid(resized_refs, nrow=max(1, int(n_refimgs / 2)), padding=0)
+                        grid = make_grid(
+                            resized_refs,
+                            nrow=concept_grid_cols,
+                            padding=0,
+                            pad_value=255,
+                        )
                         grid_np = np.array(zimage.imgify(grid.detach().cpu()))
                         ax.imshow(grid_np)
+                        ax.set_facecolor("white")
                 else:
                     ax.axis("off")
 
             elif c == 3:
                 if r == 0:
-                    ax.set_title("Difference to prot.")
-                ax.imshow(np.zeros((150, 150, 3)), alpha=0.2)
+                    ax.set_title("Difference to prot.", fontsize=12, pad=8)
+                ax.imshow(np.ones((150, 150, 3)), alpha=1.0)
                 delta_R = (float(channel_rels_vec[topk_ind[r]].round(decimals=3)) - float(mean[topk_ind[r]].round(decimals=3))) * 100.0
                 if delta_R > 2:
-                    textstr = f"ΔR = {delta_R:+.1f}%\n⚠ over-used"
-                    edge_color = "#ff0000"
+                    textstr = f"ΔR = {delta_R:+.1f}%\nover-used"
+                    edge_color = "#c43d2f"
+                    fill_color = "#fdecea"
                 elif delta_R < -2:
-                    textstr = f"ΔR = {delta_R:+.1f}%\n⚠ under-used"
-                    edge_color = "#ff0000"
+                    textstr = f"ΔR = {delta_R:+.1f}%\nunder-used"
+                    edge_color = "#c43d2f"
+                    fill_color = "#fdecea"
                 else:
-                    textstr = f"ΔR = {delta_R:+.1f}%\n✓ similar"
-                    edge_color = "#00cc00"
+                    textstr = f"ΔR = {delta_R:+.1f}%\nsimilar"
+                    edge_color = "#1f9d55"
+                    fill_color = "#e7f6ec"
 
-                rect = patches.Rectangle((0, 0), 150, 150, linewidth=3, edgecolor=edge_color, facecolor='white')
+                rect = patches.Rectangle((0, 0), 150, 150, linewidth=2.5, edgecolor=edge_color, facecolor='white')
                 ax.add_patch(rect)
                 lines = textstr.split('\n')
-                ax.text(75, 60, lines[0], fontsize=10, va='center', ha='center',
-                        bbox=dict(facecolor=edge_color, edgecolor='none', alpha=0.2))
-                ax.text(75, 90, lines[1], fontproperties=FontProperties(weight='bold'), va='center', ha='center', color=edge_color)
+                ax.text(
+                    75, 55, lines[1], fontproperties=FontProperties(weight='bold'),
+                    va='center', ha='center', color=edge_color, fontsize=11
+                )
+                ax.text(
+                    75, 88, lines[0], fontsize=10, va='center', ha='center',
+                    bbox=dict(facecolor=fill_color, edgecolor='none', alpha=1.0, boxstyle="round,pad=0.25")
+                )
                 ax.set_xlim([0, 150]); ax.set_ylim([0, 150]); ax.axis("off")
 
             elif c == 4:
                 if r == 0:
-                    ax.set_title("Prot localization")
-                hm_pil_p = zimage.imgify(cond_heatmap_p[r], symmetric=True, cmap="bwr", level=10)
-                ax.imshow(resize(hm_pil_p))
+                    ax.set_title("Prot localization", fontsize=12, pad=8)
+                proto_concept_rel = float(mean[topk_ind[r]])
+                if proto_concept_rel <= relevance_too_small_thr:
+                    _show_message_box(ax, "Relevance is\ntoo small")
+                else:
+                    hm_pil_p = zimage.imgify(cond_heatmap_p[r], symmetric=True, cmap="bwr", level=10)
+                    ax.imshow(resize(hm_pil_p))
                 ax.yaxis.set_label_position("right")
-                ax.set_ylabel(f"concept {topk_ind[r]}\n relevance: {(float(mean[topk_ind[r]]) * 100):.1f}%")
+                ax.set_ylabel(f"concept {topk_ind[r]}\n{(float(mean[topk_ind[r]]) * 100):.1f}%", fontsize=10, labelpad=8)
 
             elif c == 5:
                 if r == 0:
-                    ax.set_title("prototype")
+                    ax.set_title("prototype", fontsize=12, pad=8)
                     ax.imshow(proto_img_res.permute(1, 2, 0).cpu().numpy())
                 elif r == 1:
-                    ax.set_title("heatmap")
-                    ax.imshow(proto_heatmap_res)
+                    ax.set_title("heatmap", fontsize=12, pad=8)
+                    if flood_segment_too_small_proto:
+                        _show_message_box(ax, "Flood segment\nis too small")
+                    else:
+                        ax.imshow(proto_heatmap_res)
                 else:
                     ax.axis("off")
 

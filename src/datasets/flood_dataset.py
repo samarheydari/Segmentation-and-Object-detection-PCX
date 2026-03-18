@@ -19,6 +19,36 @@ class FloodDataset(BaseDataset):
     class_names = ["background", "flood"]
     color_list = [[0, 0, 0], [1, 1, 1]]
 
+    @staticmethod
+    def _default_transform(image):
+        """
+        Convert image (numpy/PIL/tensor) to float torch tensor in CHW with range [0, 1].
+        """
+        if torch.is_tensor(image):
+            t = image.detach().clone()
+        elif isinstance(image, Image.Image):
+            t = torch.from_numpy(np.array(image))
+        elif isinstance(image, np.ndarray):
+            t = torch.from_numpy(image)
+        else:
+            raise TypeError(f"Unsupported image type for transform: {type(image)}")
+
+        if t.ndim == 4 and t.shape[0] == 1:
+            t = t[0]
+        if t.ndim == 2:
+            t = t.unsqueeze(-1)
+        if t.ndim != 3:
+            raise ValueError(f"Expected image with 3 dims (HWC/CHW), got shape {tuple(t.shape)}")
+
+        # HWC -> CHW when channel is last
+        if t.shape[0] not in (1, 3) and t.shape[-1] in (1, 3):
+            t = t.permute(2, 0, 1)
+
+        t = t.to(dtype=torch.float32)
+        if t.max().item() > 1.0:
+            t = t / 255.0
+        return t
+
     def __init__(
         self,
         root: Optional[str] = None,
@@ -66,6 +96,8 @@ class FloodDataset(BaseDataset):
         self.flip = flip
         self.bd_dilate_size = bd_dilate_size
         self.return_or_dims = return_or_dims
+        # Keep compatibility with callers expecting dataset.transform(image)
+        self.transform = transform if transform is not None else self._default_transform
 
         # filename alignment
         self.strict_pairing = strict_pairing
@@ -238,6 +270,50 @@ class FloodDataset(BaseDataset):
             pred = self.label2color(preds[i])
             save_img = Image.fromarray(pred)
             save_img.save(os.path.join(sv_path, name[i] + ".png"))
+
+    def reverse_normalization(self, data: torch.Tensor) -> torch.Tensor:
+        """
+        Undo dataset normalization and return CPU float tensor [C, H, W] in [0,255].
+        """
+        if not isinstance(data, torch.Tensor):
+            data = torch.from_numpy(np.array(data))
+
+        x = data.float()
+        means = torch.tensor(self.mean, dtype=x.dtype, device=x.device).view(-1, 1, 1)
+        stds = torch.tensor(self.std, dtype=x.dtype, device=x.device).view(-1, 1, 1)
+        x = x * stds + means
+        x = x * 255.0
+        return x.clamp(0, 255).to(torch.float32).cpu()
+
+    def reverse_augmentation(self, data: torch.Tensor) -> torch.Tensor:
+        """
+        Convert a preprocessed tensor (C,H,W) back to a displayable uint8
+        image tensor on CPU. Prefer reverse_normalization; fall back to a
+        min-max rescaling when necessary.
+        """
+        import torch as _torch
+
+        try:
+            x = self.reverse_normalization(data)
+            # Ensure we return 3 channels for RGB drawing utilities
+            if x.ndim == 3 and x.shape[0] >= 3:
+                return x[:3]
+            return x
+        except Exception:
+            # Fallback: min-max scale to [0,255]
+            if not isinstance(data, _torch.Tensor):
+                data = _torch.from_numpy(np.array(data))
+            x = data.float()
+            mn = x.min()
+            mx = x.max()
+            if mx == mn:
+                x = _torch.zeros_like(x)
+            else:
+                x = (x - mn) / (mx - mn)
+            x = (x * 255.0).clamp(0, 255).to(_torch.float32).cpu()
+            if x.ndim == 3 and x.shape[0] >= 3:
+                return x[:3]
+            return x
 
 
 # backward compat alias

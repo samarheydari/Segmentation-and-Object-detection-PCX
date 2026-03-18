@@ -56,7 +56,8 @@ def plot_pcx_explanations(class_id, model_name, model, img, orig_img, dataset, o
                           layer_name="decoder.center.0.0",
                           ref_imgs_path="../output/ref_imgs/", output_dir_pcx="../output_synthetic/pcx/yolo_person_car",
                           output_dir_crp="../output/crp/yolo_person_car/", plot_prot_crops=True,
-                          letterbox_shape=None, original_shape=None, rescale_boxes_fn=None, dataset_type=None):
+                          letterbox_shape=None, original_shape=None, rescale_boxes_fn=None, dataset_type=None,
+                          show_proto_concepts=True, skip_prototypes=None):
 
     device = "cuda:1" if torch.cuda.is_available() else "cpu"
     device = "cpu"
@@ -443,6 +444,7 @@ def plot_pcx_explanations(class_id, model_name, model, img, orig_img, dataset, o
         A_np = attributions.detach().cpu().numpy()  # [N, C]
         means = gmm.means_.astype(np.float32)  # [K, C]
         K, C = means.shape
+        skip_prototypes = set(skip_prototypes or [])
 
         # --- nearest samples to each prototype mean ---
         diff = A_np[:, None, :] - gmm.means_[None, :, :]  # [N, K, C]
@@ -570,94 +572,113 @@ def plot_pcx_explanations(class_id, model_name, model, img, orig_img, dataset, o
         Pn = means / (np.linalg.norm(means, axis=1, keepdims=True) + 1e-12)
         sim_mean = (Pn @ mu_n)  # [K], cosine-like similarity
 
-        # --- concept weight matrix for current K ---
-        concept_matrix = torch.from_numpy(means[:, top_concepts]).T  # [N_CONCEPTS, K]
+        kept_proto_idxs = [pj for pj in range(K) if pj not in skip_prototypes]
+        if not kept_proto_idxs:
+            print("[proto_plot] all prototypes were skipped; not saving prototype plot.")
+        else:
+            all_crops = [all_crops[pj] for pj in kept_proto_idxs]
+            coverage_pct = coverage_pct[kept_proto_idxs]
+            sim_mean = sim_mean[kept_proto_idxs]
+            means = means[kept_proto_idxs]
+            K_plot = len(kept_proto_idxs)
 
-        # --- make all thumbnails uniform square + vertical strips ---
-        THUMB = 120
-        resize_square = T.Compose([
-            T.Resize(THUMB),  # smaller side -> THUMB (keeps aspect)
-            T.CenterCrop((THUMB, THUMB))
-        ])
-        all_resized = [[resize_square(t.clamp(0, 1)) for t in col] for col in all_crops]
+            # --- concept weight matrix for current K ---
+            concept_matrix = torch.from_numpy(means[:, top_concepts]).T  # [N_CONCEPTS, K_plot]
 
-        # --- figure: (N_CONCEPTS+1) × (K+1); taller top row for vertical columns ---
-        top_row_ratio = max(8, NUM_SAMPLES_PER_PROTO + 2)
-        fig_pc, axs = plt.subplots(
-            nrows=N_CONCEPTS + 1, ncols=K + 1,
-            figsize=(K + 6, N_CONCEPTS + 6), dpi=170,
-            gridspec_kw={'width_ratios': [6] + [1] * K, 'height_ratios': [top_row_ratio] + [1] * N_CONCEPTS}
-        )
+            # --- make all thumbnails uniform square + vertical strips ---
+            THUMB = 120
+            resize_square = T.Compose([
+                T.Resize(THUMB),  # smaller side -> THUMB (keeps aspect)
+                T.CenterCrop((THUMB, THUMB))
+            ])
+            all_resized = [[resize_square(t.clamp(0, 1)) for t in col] for col in all_crops]
 
-        # --- top row: prototype strips (VERTICAL) ---
-        for pj in range(K):
-            # nrow=1 -> one image per row => vertical strip
-            grid = torchvision.utils.make_grid(all_resized[pj], nrow=1, padding=1)
-            grid_np = grid.permute(1, 2, 0).cpu().numpy()
-            grid_np = (grid_np * 255.0).clip(0, 255).astype(np.uint8)  # float[0,1] -> uint8
+            top_row_ratio = max(8, NUM_SAMPLES_PER_PROTO + 2)
+            if show_proto_concepts:
+                fig_pc, axs = plt.subplots(
+                    nrows=N_CONCEPTS + 1, ncols=K_plot + 1,
+                    figsize=(K_plot + 6, N_CONCEPTS + 6), dpi=170,
+                    gridspec_kw={'width_ratios': [6] + [1] * K_plot, 'height_ratios': [top_row_ratio] + [1] * N_CONCEPTS}
+                )
+            else:
+                fig_pc, axs = plt.subplots(
+                    nrows=1, ncols=K_plot,
+                    figsize=(max(K_plot * 1.6, 4), top_row_ratio), dpi=170
+                )
+                axs = np.atleast_1d(axs)
 
-            axs[0, pj + 1].imshow(grid_np, aspect='auto')
-            axs[0, pj + 1].set_title(
-                f"Prototype {pj}\nCovers {coverage_pct[pj]:.0f}%\nSim. {sim_mean[pj]:.2f}",
-                fontsize=9
-            )
-            axs[0, pj + 1].axis("off")
-        axs[0, 0].axis("off")
+            # --- top row: prototype strips (VERTICAL) ---
+            for local_idx, proto_idx in enumerate(kept_proto_idxs):
+                grid = torchvision.utils.make_grid(all_resized[local_idx], nrow=1, padding=1)
+                grid_np = grid.permute(1, 2, 0).cpu().numpy()
+                grid_np = (grid_np * 255.0).clip(0, 255).astype(np.uint8)  # float[0,1] -> uint8
 
-        # --- first column: concept reference-image grids (also square + scaled) ---
-        for i, cidx in enumerate(top_concepts):
-            imgs = ref_imgs_concepts.get(int(cidx), [])
-            tiles = []
-            for im in imgs[:N_REF_PER_CONCEPT]:
-                if isinstance(im, Image.Image):
-                    t = F.to_tensor(im).clamp(0, 1)
-                else:
-                    arr = np.asarray(im)
-                    if arr.ndim == 3:
-                        t = torch.from_numpy(arr).permute(2, 0, 1).float().div(255.0).clamp(0, 1)
-                    else:
-                        continue
-                tiles.append(resize_square(t))
+                ax = axs[0, local_idx + 1] if show_proto_concepts else axs[local_idx]
+                ax.imshow(grid_np, aspect='auto')
+                ax.set_title(
+                    f"Prototype {proto_idx}\nCovers {coverage_pct[local_idx]:.0f}%\nSim. {sim_mean[local_idx]:.2f}",
+                    fontsize=9
+                )
+                ax.axis("off")
+            if show_proto_concepts:
+                axs[0, 0].axis("off")
 
-            if len(tiles) == 0:
-                row0 = int(ranked[0, 0])  # per-det row id
-                ds0 = int(meta[row0]["dataset_idx"])  # map to dataset index
-                full_tensor, _ = dataset[ds0]
-                full_uint8 = dataset.reverse_normalization(full_tensor).clamp(0, 255).byte()
-                full_pil = F.to_pil_image(full_uint8)
-                tiles = [resize_square(F.to_tensor(full_pil).clamp(0, 1))]
+            if show_proto_concepts:
+                # --- first column: concept reference-image grids (also square + scaled) ---
+                for i, cidx in enumerate(top_concepts):
+                    imgs = ref_imgs_concepts.get(int(cidx), [])
+                    tiles = []
+                    for im in imgs[:N_REF_PER_CONCEPT]:
+                        if isinstance(im, Image.Image):
+                            t = F.to_tensor(im).clamp(0, 1)
+                        else:
+                            arr = np.asarray(im)
+                            if arr.ndim == 3:
+                                t = torch.from_numpy(arr).permute(2, 0, 1).float().div(255.0).clamp(0, 1)
+                            else:
+                                continue
+                        tiles.append(resize_square(t))
 
-            nrow = max(1, min(len(tiles), N_REF_PER_CONCEPT))
-            grid = make_grid(tiles, nrow=nrow, padding=0)
-            grid_np = grid.permute(1, 2, 0).cpu().numpy()
-            grid_np = (grid_np * 255.0).clip(0, 255).astype(np.uint8)
+                    if len(tiles) == 0:
+                        row0 = int(ranked[0, kept_proto_idxs[0]])  # per-det row id
+                        ds0 = int(meta[row0]["dataset_idx"])  # map to dataset index
+                        full_tensor, _ = dataset[ds0]
+                        full_uint8 = dataset.reverse_normalization(full_tensor).clamp(0, 255).byte()
+                        full_pil = F.to_pil_image(full_uint8)
+                        tiles = [resize_square(F.to_tensor(full_pil).clamp(0, 1))]
 
-            axs[i + 1, 0].imshow(grid_np)
-            axs[i + 1, 0].set_ylabel(f"concept {int(cidx)}", rotation=90, labelpad=8)
-            axs[i + 1, 0].set_yticks([]);
-            axs[i + 1, 0].set_xticks([])
+                    nrow = max(1, min(len(tiles), N_REF_PER_CONCEPT))
+                    grid = make_grid(tiles, nrow=nrow, padding=0)
+                    grid_np = grid.permute(1, 2, 0).cpu().numpy()
+                    grid_np = (grid_np * 255.0).clip(0, 255).astype(np.uint8)
 
-        # --- inner cells: concept weight heat (signed; value printed) ---
-        vmax = float(concept_matrix.abs().max().item()) if hasattr(concept_matrix, "abs") else float(
-            np.abs(concept_matrix).max())
-        for i in range(N_CONCEPTS):
-            for j in range(K):
-                val = concept_matrix[i, j].item()
-                axs[i + 1, j + 1].imshow([[abs(val)]], vmin=0, vmax=vmax,
-                                         cmap=("Reds" if val >= 0 else "Blues"))
-                color = "white" if abs(val) > 0.5 * vmax else "black"
-                axs[i + 1, j + 1].text(0, 0, f"{val * 100:.1f}", ha="center", va="center", color=color, fontsize=10)
-                axs[i + 1, j + 1].axis("off")
+                    axs[i + 1, 0].imshow(grid_np)
+                    axs[i + 1, 0].set_ylabel(f"concept {int(cidx)}", rotation=90, labelpad=8)
+                    axs[i + 1, 0].set_yticks([])
+                    axs[i + 1, 0].set_xticks([])
 
-        plt.tight_layout()
+                # --- inner cells: concept weight heat (signed; value printed) ---
+                vmax = float(concept_matrix.abs().max().item()) if hasattr(concept_matrix, "abs") else float(
+                    np.abs(concept_matrix).max())
+                for i in range(N_CONCEPTS):
+                    for j in range(K_plot):
+                        val = concept_matrix[i, j].item()
+                        axs[i + 1, j + 1].imshow([[abs(val)]], vmin=0, vmax=vmax,
+                                                 cmap=("Reds" if val >= 0 else "Blues"))
+                        color = "white" if abs(val) > 0.5 * vmax else "black"
+                        axs[i + 1, j + 1].text(0, 0, f"{val * 100:.1f}", ha="center", va="center", color=color, fontsize=10)
+                        axs[i + 1, j + 1].axis("off")
 
-        # save next to your other PCX plots
-        plot_dir = f"../output_{dataset_type}/pcx/pcx_plots"
-        out_png = os.path.join(plot_dir, f"{layer_name}_class{class_id}_K{K}_proto_concepts.png")
-        os.makedirs(os.path.dirname(out_png), exist_ok=True)
-        fig_pc.savefig(out_png, dpi=200, bbox_inches="tight")
-        plt.close(fig_pc)
-        print(f"➡️ prototype+concept figure: {out_png}")
+            plt.tight_layout()
+
+            # save next to your other PCX plots
+            plot_dir = f"../output_{dataset_type}/pcx/pcx_plots"
+            suffix = "proto_concepts" if show_proto_concepts else "prototypes_only"
+            out_png = os.path.join(plot_dir, f"{layer_name}_class{class_id}_K{K_plot}_{suffix}.png")
+            os.makedirs(os.path.dirname(out_png), exist_ok=True)
+            fig_pc.savefig(out_png, dpi=200, bbox_inches="tight")
+            plt.close(fig_pc)
+            print(f"➡️ prototype figure: {out_png}")
 
     # --- use the SAME detection index you are looping over ---
     scores_det, boxes_det = model.predict_with_boxes(data)  # data is (1,C,H,W)

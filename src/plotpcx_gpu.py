@@ -35,7 +35,7 @@ from crp.image import imgify
 #sys.path.append("/Users/heydari/Desktop/test/FHHI-XAI-PIDNET/")
 
 from src.glocal_analysis import run_analysis
-from src.datasets.flood_dataset import FloodDataset
+from src.datasets.flood_datase_crp import FloodDataset
 from src.datasets.DLR_dataset import DatasetDLR
 from src.plot_crp_explanations import plot_explanations, plot_one_image_explanation
 from src.minio_client import MinIOClient
@@ -58,7 +58,11 @@ _HEATMAP_CMAP = LinearSegmentedColormap.from_list(
     ],
 )
 if HEATMAP_CMAP_NAME not in plt.colormaps():
-    plt.register_cmap(HEATMAP_CMAP_NAME, _HEATMAP_CMAP)
+    if hasattr(plt, "register_cmap"):
+        plt.register_cmap(HEATMAP_CMAP_NAME, _HEATMAP_CMAP)
+    else:
+        import matplotlib
+        matplotlib.colormaps.register(_HEATMAP_CMAP, name=HEATMAP_CMAP_NAME)
 
 
 def _tensor_to_uint8_image(t: torch.Tensor) -> torch.Tensor:
@@ -71,6 +75,100 @@ def _tensor_to_uint8_image(t: torch.Tensor) -> torch.Tensor:
         t = t * 255.0
     t = t.clamp(0, 255)
     return t.to(torch.uint8)
+
+
+def _extract_sample_image_target(sample):
+    """
+    Robustly parse dataset samples that may return (img, target) or longer tuples.
+    Returns image tensor-like object and optional target.
+    """
+    if isinstance(sample, (tuple, list)):
+        if len(sample) == 0:
+            raise ValueError("Dataset sample is empty.")
+        image = sample[0]
+        target = sample[1] if len(sample) > 1 else None
+        return image, target
+    return sample, None
+
+
+class _CRPTwoItemDatasetView:
+    """Adapter so CRP always sees dataset samples as (data, target)."""
+
+    def __init__(self, dataset):
+        self._dataset = dataset
+
+    def __len__(self):
+        return len(self._dataset)
+
+    def __getitem__(self, index):
+        sample = self._dataset[index]
+        data, target = _extract_sample_image_target(sample)
+        data = _ensure_sample_image_tensor(data).float()
+        if isinstance(target, np.ndarray):
+            target = torch.from_numpy(target)
+        elif target is not None and not torch.is_tensor(target):
+            target = torch.as_tensor(target)
+        return data, target
+
+    def __getattr__(self, name):
+        return getattr(self._dataset, name)
+
+    def reverse_normalization(self, data):
+        """
+        CRP expects this API. Delegate when available, otherwise provide a safe fallback.
+        """
+        if hasattr(self._dataset, "reverse_normalization"):
+            return self._dataset.reverse_normalization(data)
+        if hasattr(self._dataset, "reverse_augmentation"):
+            return self._dataset.reverse_augmentation(data)
+        t = data if torch.is_tensor(data) else torch.from_numpy(np.asarray(data))
+        t = t.detach().cpu().float()
+        if t.ndim == 3 and t.shape[0] in (1, 3):
+            return t
+        if t.ndim == 3 and t.shape[-1] in (1, 3):
+            return t.permute(2, 0, 1).contiguous()
+        return t
+
+
+def _ensure_sample_image_tensor(image):
+    """Convert dataset image payload to torch tensor (prefer CHW layout)."""
+    if torch.is_tensor(image):
+        t = image
+    elif isinstance(image, np.ndarray):
+        t = torch.from_numpy(image)
+    else:
+        raise TypeError(f"Unsupported image sample type: {type(image)}")
+
+    if t.ndim == 4 and t.shape[0] == 1:
+        t = t[0]
+    if t.ndim == 2:
+        t = t.unsqueeze(0)
+    # HWC -> CHW
+    if t.ndim == 3 and t.shape[0] not in (1, 3) and t.shape[-1] in (1, 3):
+        t = t.permute(2, 0, 1)
+    return t.contiguous()
+
+
+def _show_message_box(
+    ax: plt.Axes,
+    message: str,
+    facecolor: str = "#eef2ff",
+    edgecolor: str = "#1f3fff",
+    textcolor: str = "#1f3fff",
+) -> None:
+    ax.imshow(np.ones((150, 150, 3), dtype=np.float32))
+    rect = patches.Rectangle((0, 0), 149, 149, linewidth=2.5, edgecolor=edgecolor, facecolor=facecolor, alpha=0.95)
+    ax.add_patch(rect)
+    ax.text(
+        75, 75, message,
+        ha="center", va="center",
+        fontsize=9, color=textcolor, fontweight="bold",
+        wrap=True
+    )
+    ax.set_xlim([0, 150])
+    ax.set_ylim([149, 0])
+    ax.set_xticks([])
+    ax.set_yticks([])
 
 
 def _resize_array_to_panel(arr: np.ndarray) -> np.ndarray:
@@ -91,6 +189,21 @@ def _resize_array_to_panel(arr: np.ndarray) -> np.ndarray:
         return np.asarray(pil_resized)
     except Exception:
         return arr
+
+
+def _resize_mask_to_panel(mask) -> np.ndarray | None:
+    """Resize a binary mask to the standard panel size for contour plotting."""
+    try:
+        if mask is None:
+            return None
+        mask_np = mask.detach().cpu().numpy() if torch.is_tensor(mask) else np.asarray(mask)
+        if mask_np.ndim > 2:
+            mask_np = np.squeeze(mask_np)
+        mask_img = Image.fromarray((mask_np > 0).astype(np.uint8) * 255)
+        mask_img = mask_img.resize((PANEL_SIZE[1], PANEL_SIZE[0]), Image.NEAREST)
+        return np.asarray(mask_img, dtype=float)
+    except Exception:
+        return None
 
 def _coerce_device(device_like=None) -> torch.device:
     """Return a concrete torch.device for the given specification."""
@@ -246,7 +359,7 @@ def _call_get_max_reference(fv, concept_ids, layer_name, composite, n_ref, plot_
     return refs
 
 
-def get_ref_images(fv, topk_ind, layer_name, composite, n_ref=12, ref_imgs_save_path="examples/output/ref_imgs_pidnet/"):
+def get_ref_images(fv, topk_ind, layer_name, composite, n_ref=12, ref_imgs_save_path="examples/output/new-ref-img-BRK/"):
     """
     Get and cache reference images. CPU/PIL based.
     """
@@ -317,7 +430,7 @@ def get_ref_images(fv, topk_ind, layer_name, composite, n_ref=12, ref_imgs_save_
 
 def plot_pcx_explanations(model_name, model, dataset, sample_id, n_concepts, n_refimgs, num_prototypes,
                           layer_name, ref_imgs_path, output_dir_pcx, output_dir_crp, device=None,
-                          precision: str = "fp32"):
+                          precision: str = "fp32", skip_prototype: bool = False):
     """
     Wrapper that loads the sample, resets memory trackers, calls pidnet version,
     and ensures cleanup.
@@ -326,7 +439,9 @@ def plot_pcx_explanations(model_name, model, dataset, sample_id, n_concepts, n_r
         active_device = _coerce_device(device)
         _maybe_reset_cuda_max_memory(active_device)
 
-        image_tensor, t = dataset[sample_id]
+        sample = dataset[sample_id]
+        image_tensor, _ = _extract_sample_image_target(sample)
+        image_tensor = _ensure_sample_image_tensor(image_tensor)
         image_tensor = image_tensor.to(active_device)
         if precision == "autocast_fp16" and active_device.type == "cuda":
             image_tensor = image_tensor.half()
@@ -336,7 +451,8 @@ def plot_pcx_explanations(model_name, model, dataset, sample_id, n_concepts, n_r
             layer_name=layer_name, ref_imgs_path=ref_imgs_path,
             output_dir_pcx=output_dir_pcx, output_dir_crp=output_dir_crp,
             device=active_device,
-            precision=precision
+            precision=precision,
+            skip_prototype=skip_prototype,
         )
 
         gc.collect()
@@ -354,11 +470,12 @@ def plot_pcx_explanations(model_name, model, dataset, sample_id, n_concepts, n_r
 def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
                                  n_concepts=5, n_refimgs=12, num_prototypes=2,
                                  layer_name="decoder.center.0.0",
-                                 ref_imgs_path="examples/output/ref_imgs_pidnet/",
-                                 output_dir_pcx="examples/output/pcx/pidnet_flood/",
-                                 output_dir_crp="examples/output/crp/pidnet_flood/",
+                                 ref_imgs_path="examples/output/new-ref-img-BRK/",
+                                 output_dir_pcx="examples/output/pcx/PCX-BRK-NEW/",
+                                 output_dir_crp="examples/output/crp/CRP-BRK-NEW/",
                                  device=None,
-                                 precision: str = "fp32"):
+                                 precision: str = "fp32",
+                                 skip_prototype: bool = False):
     """
     Main function that computes PCX/CRP visualizations.
     This version keeps tensors on GPU when possible and only moves to CPU for
@@ -379,9 +496,10 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
     # Setting up CRP / attribution / visualizer objects
     attribution = ATTRIBUTORS[model_name](model)
     composite = COMPOSITES[model_name](canonizers=[CANONIZERS[model_name]()])
+    crp_dataset = _CRPTwoItemDatasetView(dataset)
     fv = VISUALIZATIONS[model_name](
         attribution,
-        dataset,
+        crp_dataset,
         layer_names,
         preprocess_fn=lambda x: x,
         path=output_dir_crp,
@@ -487,11 +605,17 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
     del attributions
     _maybe_empty_cuda_cache(active_device)
 
-    # Closest prototype sample from dataset (data_p, target_p usually CPU tensors)
-    data_p, target_p = dataset[closest_sample_to_mean]
-    # keep a CPU copy of target_p for mask computations; move input data to device for model ops
-    target_p_cpu = target_p.detach().cpu() if isinstance(target_p, torch.Tensor) else target_p
-    data_p_device = data_p[None].to(active_device, non_blocking=non_blocking)
+    data_p_cpu = None
+    target_p_cpu = None
+    data_p_device = None
+    if not skip_prototype:
+        # Closest prototype sample from dataset (data_p, target_p usually CPU tensors)
+        sample_p = dataset[closest_sample_to_mean]
+        data_p, target_p = _extract_sample_image_target(sample_p)
+        data_p = _ensure_sample_image_tensor(data_p)
+        # keep a CPU copy of target_p for mask computations; move input data to device for model ops
+        target_p_cpu = target_p.detach().cpu() if isinstance(target_p, torch.Tensor) else target_p
+        data_p_device = data_p[None].to(active_device, non_blocking=non_blocking)
 
     # Getting top concepts/neurons for the given image in the given layer
     channel_rels = channel_rels.float()
@@ -551,10 +675,13 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
         return heatmaps
 
     try:
-        cond_heatmap_p = _collect_conditional_heatmaps(data_p_device, conditions)
-        data_p_cpu = data_p_device.detach().cpu()
-        del data_p_device
-        _maybe_empty_cuda_cache(active_device)
+        cond_heatmap_p = None
+        if not skip_prototype and data_p_device is not None:
+            cond_heatmap_p = _collect_conditional_heatmaps(data_p_device, conditions)
+            data_p_cpu = data_p_device.detach().cpu()
+            del data_p_device
+            data_p_device = None
+            _maybe_empty_cuda_cache(active_device)
 
         cond_heatmap = _collect_conditional_heatmaps(data, conditions)
         data = None
@@ -584,6 +711,7 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
                     output_dir_crp=output_dir_crp,
                     device=torch.device("cpu"),
                     precision="fp32",
+                    skip_prototype=skip_prototype,
                 )
             finally:
                 model.to(active_device)
@@ -631,55 +759,50 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
         except Exception:
             img_with_mask = Image.new("RGB", (PANEL_SIZE[1], PANEL_SIZE[0]), color=(128, 128, 128))
 
-    # Prototype mask: ensure CPU tensor
-    try:
-        if isinstance(target_p_cpu, torch.Tensor):
-            mask_prototype = (((target_p_cpu - target_p_cpu.min()) / (target_p_cpu.max() - target_p_cpu.min())) > 0.5)[0]
-        else:
-            # fallback if target not tensor
-            mask_prototype = torch.zeros((1, 1), dtype=torch.bool)
-    except Exception:
-        mask_prototype = torch.zeros((1, 1), dtype=torch.bool)
-
-    # Sample prototype image: reverse augmentation expects CPU input; use data_p_device.cpu()
+    mask_prototype = None
+    prototype_overlay_panel = None
+    prototype_contour_panel = None
     sample_prototype_cpu = None
     prototype_base_panel = None
-    try:
-        sample_prototype_cpu = dataset.reverse_augmentation(data_p_cpu.float())
-        base_proto_tensor = _tensor_to_uint8_image(sample_prototype_cpu[:3, :, :][0])
-        base_prototype_img = F.to_pil_image(base_proto_tensor)
-        prototype_base_panel = base_prototype_img.resize((PANEL_SIZE[1], PANEL_SIZE[0]), Image.BILINEAR)
-        img_prototype = base_prototype_img
-    except Exception:
-        # fallback
+    if not skip_prototype:
+        # Prototype mask: ensure CPU tensor
         try:
-            if sample_prototype_cpu is None:
-                sample_prototype_cpu = dataset.reverse_augmentation(data_p_cpu.float())
-            base_proto_tensor = _tensor_to_uint8_image(sample_prototype_cpu[:3, :, :][0])
-            base_prototype_img = F.to_pil_image(base_proto_tensor)
-            prototype_base_panel = base_prototype_img.resize((PANEL_SIZE[1], PANEL_SIZE[0]), Image.BILINEAR)
-            img_prototype = base_prototype_img
+            if isinstance(target_p_cpu, torch.Tensor):
+                target_p_cpu = target_p_cpu.float()
+                denom = (target_p_cpu.max() - target_p_cpu.min()).clamp_min(1e-8)
+                mask_prototype = (((target_p_cpu - target_p_cpu.min()) / denom) > 0.5)[0].bool()
+            else:
+                mask_prototype = torch.zeros((1, 1), dtype=torch.bool)
         except Exception:
-            img_prototype = Image.new("RGB", (PANEL_SIZE[1], PANEL_SIZE[0]), color=(128, 128, 128))
-            prototype_base_panel = img_prototype
-    finally:
-        _maybe_empty_cuda_cache(active_device)
-        data_p_cpu = None
+            mask_prototype = torch.zeros((1, 1), dtype=torch.bool)
 
-    # Try to get prototype RGB image via dataset sample for true colors
-    prototype_rgb_panel = None
-    try:
-        fv_dataset_orig = getattr(fv, "dataset", None)
-        fv.dataset = dataset
-        proto_sample_pil = imgify(fv.get_data_sample(closest_sample_to_mean, preprocessing=False)[0][0])
-        if fv_dataset_orig is not None:
-            fv.dataset = fv_dataset_orig
-        prototype_rgb_panel = _resize_array_to_panel(np.asarray(proto_sample_pil))
-    except Exception:
-        if prototype_base_panel is not None:
-            prototype_rgb_panel = _resize_array_to_panel(np.asarray(prototype_base_panel))
-        else:
-            prototype_rgb_panel = np.ones((PANEL_SIZE[0], PANEL_SIZE[1], 3), dtype=np.uint8) * 128
+        # Sample prototype image: reverse augmentation expects CPU input
+        try:
+            sample_prototype_cpu = dataset.reverse_augmentation(data_p_cpu.float())
+            base_proto_tensor = _tensor_to_uint8_image(sample_prototype_cpu[:3, :, :][0])
+            if mask_prototype is not None and tuple(mask_prototype.shape) != tuple(base_proto_tensor.shape[-2:]):
+                mask_prototype = torch.nn.functional.interpolate(
+                    mask_prototype.float().unsqueeze(0).unsqueeze(0),
+                    size=base_proto_tensor.shape[-2:],
+                    mode='nearest',
+                ).bool().squeeze(0).squeeze(0)
+            prototype_overlay = draw_segmentation_masks(base_proto_tensor, masks=mask_prototype, alpha=0.3, colors=["red"])
+            prototype_overlay_panel = _resize_array_to_panel(np.asarray(F.to_pil_image(prototype_overlay)))
+            prototype_contour_panel = _resize_mask_to_panel(mask_prototype)
+            prototype_base_panel = F.to_pil_image(base_proto_tensor).resize((PANEL_SIZE[1], PANEL_SIZE[0]), Image.BILINEAR)
+        except Exception:
+            try:
+                if sample_prototype_cpu is None:
+                    sample_prototype_cpu = dataset.reverse_augmentation(data_p_cpu.float())
+                base_proto_tensor = _tensor_to_uint8_image(sample_prototype_cpu[:3, :, :][0])
+                prototype_base_panel = F.to_pil_image(base_proto_tensor).resize((PANEL_SIZE[1], PANEL_SIZE[0]), Image.BILINEAR)
+                prototype_overlay_panel = _resize_array_to_panel(np.asarray(prototype_base_panel))
+            except Exception:
+                prototype_overlay_panel = np.ones((PANEL_SIZE[0], PANEL_SIZE[1], 3), dtype=np.uint8) * 128
+                prototype_base_panel = Image.fromarray(prototype_overlay_panel)
+        finally:
+            _maybe_empty_cuda_cache(active_device)
+            data_p_cpu = None
 
     # --- PLOTTING ---
     # set up figure size depending on n_concepts actually used
@@ -702,6 +825,10 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
     # Ensure axs is 2D array for consistent indexing
     if axs.ndim == 1:
         axs = axs[None, :]
+
+    flood_segment_ratio = float(mask.float().mean().item()) if torch.is_tensor(mask) else 0.0
+    flood_segment_too_small = flood_segment_ratio < 0.005  # <0.5% of pixels predicted as flood
+    relevance_too_small_thr = 1e-3  # 0.1%
 
     for r, row_axs in enumerate(axs):
         for c, ax in enumerate(row_axs):
@@ -733,11 +860,14 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
                             pass
                     elif r == 1:
                         ax.set_title("heatmap", fontsize=12, pad=8)
-                        heatmap_img = _heatmap_to_array(attr_heatmap)
-                        if heatmap_img is not None:
-                            ax.imshow(_resize_array_to_panel(heatmap_img))
+                        if flood_segment_too_small:
+                            _show_message_box(ax, "Flood segment\nis too small")
                         else:
-                            ax.axis("off")
+                            heatmap_img = _heatmap_to_array(attr_heatmap)
+                            if heatmap_img is not None:
+                                ax.imshow(_resize_array_to_panel(heatmap_img))
+                            else:
+                                ax.axis("off")
                     elif r == 2:
                         ax.set_title("class likelihood")
                         a = ax.hist(scores, bins=20, color='k')
@@ -768,17 +898,24 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
                 if c == 1:
                     if r == 0:
                         ax.set_title("cond. heatmap", fontsize=12, pad=8)
-                    ch = cond_heatmap[r] if r < len(cond_heatmap) else None
-                    heatmap_img = _heatmap_to_array(ch)
-                    if heatmap_img is not None:
-                        ax.imshow(_resize_array_to_panel(heatmap_img))
-                    else:
+                    if r >= len(topk_ind):
                         ax.axis("off")
-                    ax.set_ylabel(
-                        f"concept {topk_ind[r]}\n relevance: {(channel_rels_plot[0][topk_ind[r]] * 100):2.1f}%",
-                        fontsize=10,
-                    )
-                    ax.yaxis.labelpad = 10
+                    else:
+                        concept_rel = float(channel_rels_plot[0][topk_ind[r]])
+                        ch = cond_heatmap[r] if r < len(cond_heatmap) else None
+                        if concept_rel <= relevance_too_small_thr:
+                            _show_message_box(ax, "Relevance is\ntoo small")
+                        else:
+                            heatmap_img = _heatmap_to_array(ch)
+                            if heatmap_img is not None:
+                                ax.imshow(_resize_array_to_panel(heatmap_img))
+                            else:
+                                ax.axis("off")
+                        ax.set_ylabel(
+                            f"concept {topk_ind[r]}\n relevance: {(channel_rels_plot[0][topk_ind[r]] * 100):2.1f}%",
+                            fontsize=10,
+                        )
+                        ax.yaxis.labelpad = 10
 
                 elif c == 2:
                     if r == 0:
@@ -838,26 +975,40 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
                 elif c == 4:
                     if r == 0:
                         ax.set_title("Prot localization", fontsize=12, pad=8)
-                    proto_heatmap = cond_heatmap_p[r] if r < len(cond_heatmap_p) else None
-                    proto_img = _heatmap_to_array(proto_heatmap)
-                    if proto_img is not None:
-                        ax.imshow(_resize_array_to_panel(proto_img))
+                    if skip_prototype:
+                        _show_message_box(ax, "Prototype\nskipped")
+                    elif r >= len(topk_ind):
+                        ax.axis("off")
+                    else:
+                        proto_concept_rel = float(mean_cpu[topk_ind[r]])
+                        if proto_concept_rel <= relevance_too_small_thr:
+                            _show_message_box(ax, "Relevance is\ntoo small")
+                        else:
+                            proto_heatmap = cond_heatmap_p[r] if r < len(cond_heatmap_p) else None
+                            proto_img = _heatmap_to_array(proto_heatmap)
+                            if proto_img is not None:
+                                ax.imshow(_resize_array_to_panel(proto_img))
+                            else:
+                                ax.axis("off")
                         ax.yaxis.set_label_position("right")
                         ax.set_ylabel(
                             f"concept {topk_ind[r]}\n relevance: {(mean_cpu[topk_ind[r]] * 100):2.1f}%",
                             fontsize=10,
                         )
                         ax.yaxis.labelpad = 10
-                    else:
-                        ax.axis("off")
 
                 elif c == 5:
                     if r == 0:
-                        ax.set_title("prototype", fontsize=12, pad=8)
-                    try:
-                        ax.imshow(prototype_rgb_panel, zorder=1)
-                    except Exception:
-                        ax.axis("off")
+                        ax.set_title("prototype + mask", fontsize=12, pad=8)
+                    if skip_prototype:
+                        _show_message_box(ax, "Prototype\nskipped")
+                    else:
+                        try:
+                            ax.imshow(prototype_overlay_panel, zorder=1)
+                            if prototype_contour_panel is not None:
+                                ax.contour(prototype_contour_panel, colors="black", linewidths=[1])
+                        except Exception:
+                            ax.axis("off")
 
             except IndexError:
                 axs[r][c].axis("off")
@@ -867,6 +1018,13 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
                     ax.axis("off")
                 except Exception:
                     pass
+
+            if skip_prototype and c in (4, 5) and r > 0:
+                try:
+                    _show_message_box(ax, "Prototype\nskipped")
+                except Exception:
+                    pass
+                continue
 
             # remove ticks
             try:
@@ -886,6 +1044,7 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
     fig.subplots_adjust(left=0.08, right=0.975, wspace=0.12, hspace=0.38)
     setattr(fig, "_n_refimgs_used", effective_n_refimgs)
     setattr(fig, "_n_concepts_used", effective_n_concepts)
+    setattr(fig, "_skip_prototype", skip_prototype)
     channel_rels_plot = None
     img_cpu = None
     sample_cpu_for_plot = None
@@ -896,7 +1055,7 @@ def plot_pcx_explanations_pidnet(model_name, model, dataset, image_tensor,
 
 
 def compute_outlier_scores(model_name, model, dataset, layer_name="decoder.center.0.0", num_prototypes=2,
-                           output_dir_pcx="examples/output/pcx/pidnet_flood/", device=None):
+                           output_dir_pcx="examples/output/pcx/PCX-BRK-NEW/", device=None):
     """
     Compute outlier scores using GMM on stored attributions.
     Uses GPU where relevant but keeps sklearn parts on CPU.
@@ -909,7 +1068,8 @@ def compute_outlier_scores(model_name, model, dataset, layer_name="decoder.cente
     attribution = ATTRIBUTORS[model_name](model)
     composite = COMPOSITES[model_name](canonizers=[CANONIZERS[model_name]()])
 
-    fv = VISUALIZATIONS[model_name](attribution, dataset, layer_names,
+    crp_dataset = _CRPTwoItemDatasetView(dataset)
+    fv = VISUALIZATIONS[model_name](attribution, crp_dataset, layer_names,
                                      preprocess_fn=lambda x: x,
                                      path=output_dir_pcx,
                                      max_target="max")

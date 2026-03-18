@@ -9,7 +9,7 @@ import traceback
 
 from src.explanator import Explanator
 from src.minio_client import MinIOClient, FHHI_MINIO_BUCKET, NAPLES_MINIO_BUCKET
-from common_app_funcs import update_entity, get_bm_id, get_alert_ref_id, update_job_status, get_job_status, get_redis_conn, get_job_queue
+from common_app_funcs import update_entity, get_bm_id, get_alert_ref_id,get_flight_number,get_uav_id, update_job_status, get_job_status, get_redis_conn, get_job_queue
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '.'))
 
@@ -21,7 +21,7 @@ explanator_logger = logging.getLogger('explanator')
 explanator_logger.setLevel(logging.DEBUG)
 
 # This function will be executed by the worker in the background
-def process_image_task(entity_type, image_bucket, image_filename, task_id, bm_id, alert_ref):
+def process_image_task(entity_type, image_bucket, image_filename, task_id, bm_id, uav_id, flight_number, alert_ref):
     try:
         # Create instances for the worker process
         minio_client = MinIOClient()  # Create a new instance for the worker
@@ -46,7 +46,7 @@ def process_image_task(entity_type, image_bucket, image_filename, task_id, bm_id
         
         # Generate explanation
         logging.info(f"Task {task_id}: Explaining entity")
-        explanation_entity, explanation_images, exp_img_filenames = explanator.explain(entity_type, image_bucket, image_filename, img, bm_id=bm_id, alert_ref=alert_ref)
+        explanation_entity, explanation_images, exp_img_filenames = explanator.explain(entity_type, image_bucket, image_filename, img, bm_id=bm_id,uav_id=uav_id, flight_number=flight_number, alert_ref=alert_ref)
         
         # Upload explanation images
         logging.info(f"Task {task_id}: Uploading explanation images to MinIO")
