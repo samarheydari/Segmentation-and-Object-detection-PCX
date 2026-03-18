@@ -7,7 +7,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from datasets.flood_dataset_crp import FloodDataset as BaseDataset
+from src.datasets.base_dataset import BaseDataset
 
 
 class FloodDataset(BaseDataset):
@@ -19,9 +19,8 @@ class FloodDataset(BaseDataset):
     - All other pixels are set to `ignore_label` and will be ignored by any
       metric / analysis that uses `ignore_label` (e.g., IoU via get_confusion_matrix).
 
-    By default it will look for the official list file
-    (list/General_Flood_v3/{split}.lst) if given, otherwise it falls back
-    to scanning image/annotation folders and pairing by filename.
+    This version is tailored for CRP / run_analysis:
+    __getitem__ returns exactly (image_tensor, label_tensor).
     """
 
     class_names = ["background", "flood"]
@@ -39,15 +38,16 @@ class FloodDataset(BaseDataset):
         num_classes: int = 2,
         multi_scale: bool = False,
         flip: bool = False,
-        # if None, default to -1 to match general_flood_v3 config
+        # if None, default to -1 (matches PIDNet configs)
         ignore_label: Optional[int] = None,
         base_size: int = 2048,
-        crop_size: Tuple[int, int] = (1280, 720),
+        # Match flood_dataset default (H, W) = (720, 1280) to keep PCX aligned
+        crop_size: Tuple[int, int] = (720, 1280),
         scale_factor: int = 16,
         mean: List[float] = [0.485, 0.456, 0.406],
         std: List[float] = [0.229, 0.224, 0.225],
         bd_dilate_size: int = 4,
-        return_or_dims: bool = False,
+        return_or_dims: bool = False,  # unused in this PCX version
         strict_pairing: bool = False,
         mask_suffix_patterns: Optional[List[str]] = None,
         list_path: Optional[str] = None,
@@ -58,10 +58,10 @@ class FloodDataset(BaseDataset):
         if root is None:
             raise ValueError("root or root_dir must be provided to FloodDataset")
 
-        # Use the same default ignore label as the original general_flood_v3
+        # Use PIDNet's default sentinel (-1) unless overridden
         if ignore_label is None:
             ignore_label = -1
-        self.ignore_label = ignore_label  # expose explicitly for PCX / analysis
+        self.ignore_label = int(ignore_label)  # expose explicitly for PCX / analysis
 
         # Initialize BaseDataset (normalization, resizing, etc.)
         super(FloodDataset, self).__init__(
@@ -74,7 +74,7 @@ class FloodDataset(BaseDataset):
             split = "train"
 
         # allow dataset to live under root/General_Flood_v3 or directly under root
-        self.dataset_root = os.path.join(root, "General_Flood_v3")
+        self.dataset_root = os.path.join(root, "BRK-data")
         if not os.path.isdir(self.dataset_root):
             self.dataset_root = root
 
@@ -233,15 +233,15 @@ class FloodDataset(BaseDataset):
         """
         Map RGB mask to integer label mask.
 
-        - Start with all pixels = ignore_label
+        - Start with all pixels = ignore_label (e.g. -1)
         - For each exact color in self.color_list, set the corresponding class id.
         """
-        label = np.ones(color_map.shape[:2], dtype=np.int64) * self.ignore_label
+        label = np.full(color_map.shape[:2], self.ignore_label, dtype=np.int32)
         for i, v in enumerate(self.color_list):
             v = np.array(v, dtype=np.uint8)
             mask = (color_map == v).sum(2) == 3
-            label[mask] = i
-        return label.astype(np.int64)
+            label[mask] = np.int32(i)
+        return label
 
     def label2color(self, label: np.ndarray) -> np.ndarray:
         """
@@ -257,18 +257,19 @@ class FloodDataset(BaseDataset):
 
     def __getitem__(self, index):
         item = self.files[index]
-        name = item["name"]
 
+        # Load image as HWC uint8
         image = Image.open(item["img"]).convert("RGB")
         image = np.array(image)
-        image_or = image.copy()
-        size = image.shape
 
+        # Load mask as HWC, then convert to label map (int32 + ignore_label sentinel)
         color_map = Image.open(item["label"]).convert("RGB")
         color_map = np.array(color_map)
-        label = self.color2label(color_map)  # all non-[0,0,0]/[1,1,1] -> ignore_label
+        label = self.color2label(color_map)
 
-        image, label, edge = self.gen_sample(
+        # Apply base preprocessing (resize, normalize, edge gen, flip, etc.)
+        # gen_sample returns (image, label, edge), with image still HWC
+        image, label, _ = self.gen_sample(
             image,
             label,
             self.multi_scale,
@@ -277,17 +278,32 @@ class FloodDataset(BaseDataset):
             edge_size=self.bd_dilate_size,
             city=False,
         )
-        if self.return_or_dims:
-            return (
-                image.copy(),
-                label.copy(),
-                edge.copy(),
-                np.array(size),
-                image_or,
-                name,
-            )
+
+        # Convert image to CHW float tensor
+        image = np.asarray(image, dtype=np.float32)
+        # `gen_sample` may already return CHW (channels-first) or HWC (channels-last).
+        # Handle both to avoid double-transpose errors.
+        if image.ndim == 3 and image.shape[0] == 3:
+            # already CHW
+            img_chw = image
+        elif image.ndim == 3 and image.shape[2] == 3:
+            # HWC -> CHW
+            img_chw = image.transpose(2, 0, 1)
         else:
-            return image.copy(), label.copy(), edge.copy(), np.array(size), name
+            # Fallback: try to coerce to CHW by moving last axis first if possible
+            try:
+                img_chw = image.transpose(2, 0, 1)
+            except Exception:
+                img_chw = image
+
+        image = torch.from_numpy(img_chw).float()
+
+        # Convert label to long tensor [H,W]
+        label = np.asarray(label, dtype=np.int64)
+        label = torch.from_numpy(label).long()
+
+        # CRP / PCX / model forward needs exactly (image, label)
+        return image, label
 
     def single_scale_inference(self, config, model, image):
         return self.inference(config, model, image)
@@ -298,6 +314,60 @@ class FloodDataset(BaseDataset):
             pred = self.label2color(preds[i])
             save_img = Image.fromarray(pred)
             save_img.save(os.path.join(sv_path, name[i] + ".png"))
+
+    # --- visualization helpers (required by plotting utilities) ----------
+    def reverse_normalization(self, data: torch.Tensor) -> torch.Tensor:
+        """
+        Undo the dataset normalization (mean/std and scaling by 1/255) and
+        return a CPU `torch.uint8` tensor in shape [C, H, W] suitable for
+        torchvision drawing utilities.
+        """
+        import torch as _torch
+
+        if not isinstance(data, _torch.Tensor):
+            data = _torch.from_numpy(np.array(data))
+
+        x = data.float()
+        # Expecting shape [C, H, W]
+        means = _torch.tensor(self.mean, dtype=x.dtype, device=x.device).view(-1, 1, 1)
+        stds = _torch.tensor(self.std, dtype=x.dtype, device=x.device).view(-1, 1, 1)
+
+        # Inverse of: x = (image/255 - mean) / std
+        x = x * stds + means
+        x = x * 255.0
+        # Return float32 on CPU so autograd can attach gradients when needed.
+        x = x.clamp(0, 255).to(_torch.float32).cpu()
+        return x
+
+    def reverse_augmentation(self, data: torch.Tensor) -> torch.Tensor:
+        """
+        Convert a preprocessed tensor (C,H,W) back to a displayable uint8
+        image tensor on CPU. Prefer reverse_normalization; fall back to a
+        min-max rescaling when necessary.
+        """
+        import torch as _torch
+
+        try:
+            x = self.reverse_normalization(data)
+            # Ensure we return 3 channels for RGB drawing utilities
+            if x.ndim == 3 and x.shape[0] >= 3:
+                return x[:3]
+            return x
+        except Exception:
+            # Fallback: min-max scale to [0,255]
+            if not isinstance(data, _torch.Tensor):
+                data = _torch.from_numpy(np.array(data))
+            x = data.float()
+            mn = x.min()
+            mx = x.max()
+            if mx == mn:
+                x = _torch.zeros_like(x)
+            else:
+                x = (x - mn) / (mx - mn)
+            x = (x * 255.0).clamp(0, 255).to(_torch.float32).cpu()
+            if x.ndim == 3 and x.shape[0] >= 3:
+                return x[:3]
+            return x
 
     # --- convenience: build directly from cfg -------------------------------
     @classmethod
