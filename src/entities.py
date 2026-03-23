@@ -105,6 +105,8 @@ def get_person_vehicle_detection_explanation_entity(
 
     template["timestamp"]["value"] = timestamp
     template["bm_id"]["value"] = bm_id
+    template["uav_id"]["value"] = uav_id
+    template["flight_number"]["value"]= flight_number
     template["original_image"]["value"]["uav_id"] = uav_id
     template["original_image"]["value"]["flight_number"] = flight_number
     template["alert_ref"]["object"] = alert_ref
@@ -158,6 +160,18 @@ flood_segmentation_explanation_template = {
         "type": "Property",
         "value": None
     },
+    "uav_id": {
+        "type": "Property",
+        "value": None       
+    },
+    "flight_number": {
+        "type": "Property", 
+        "value": None
+    },
+    "alert_ref": {
+        "type": "Relationship",
+        "object": None
+    },
     # Comes from the original segmentation entity
     "original_image": {
         "type": "Property",
@@ -170,21 +184,13 @@ flood_segmentation_explanation_template = {
     },
     "original_detection": {
         "type": "Property",
+        "value": {
+            "class_categories": None,
+        },
     },
     "alert_ref": {
         "type": "Relationship",
         "object": None
-    },
-
-    # Comes from the original segmentation entity
-    "original_image": {
-        "type": "Property",
-        "value": {
-            "bucket": None,
-            "filename": None,
-            "uav_id": None,
-            "flight_number": None
-        },
     },
     "explanation_image": {
         "type": "Property",
@@ -226,11 +232,14 @@ def get_flood_segmentation_explanation_entity(
 
     template["timestamp"]["value"] = timestamp
     template["bm_id"]["value"] = bm_id
+    template["uav_id"]["value"] = uav_id
+    template["flight_number"]["value"]= flight_number
     template["original_image"]["value"]["uav_id"] = uav_id
     template["original_image"]["value"]["flight_number"] = flight_number
     template["alert_ref"]["object"] = alert_ref
     template["original_image"]["value"]["bucket"] = original_image_bucket
     template["original_image"]["value"]["filename"] = original_image_filename
+    template["original_detection"]["value"]["class_categories"] = ["flood"]
     template["explanation_image"]["value"]["bucket"] = explanation_image_bucket
     template["explanation_image"]["value"]["filename"] = explanation_image_filename
     template["explanation"]["value"]["class_id"] = class_id

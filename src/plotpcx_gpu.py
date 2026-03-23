@@ -3,6 +3,7 @@ import gc
 import sys
 import copy
 import warnings
+from typing import Optional
 import joblib
 import h5py
 import numpy as np
@@ -35,7 +36,7 @@ from crp.image import imgify
 #sys.path.append("/Users/heydari/Desktop/test/FHHI-XAI-PIDNET/")
 
 from src.glocal_analysis import run_analysis
-from src.datasets.flood_datase_crp import FloodDataset
+from src.datasets.flood_dataset_crp import FloodDataset
 from src.datasets.DLR_dataset import DatasetDLR
 from src.plot_crp_explanations import plot_explanations, plot_one_image_explanation
 from src.minio_client import MinIOClient
@@ -191,7 +192,7 @@ def _resize_array_to_panel(arr: np.ndarray) -> np.ndarray:
         return arr
 
 
-def _resize_mask_to_panel(mask) -> np.ndarray | None:
+def _resize_mask_to_panel(mask) -> Optional[np.ndarray]:
     """Resize a binary mask to the standard panel size for contour plotting."""
     try:
         if mask is None:

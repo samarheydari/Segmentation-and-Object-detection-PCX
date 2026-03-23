@@ -18,7 +18,7 @@ from sklearn.mixture import GaussianMixture
 
 # If you need CRP/PCX utilities, ensure your sys.path includes their roots
 sys.path.append("..")
-from LCRP.utils.render import vis_opaque_img_border, vis_opaque_img_border_v2
+from LCRP.utils.render import vis_opaque_img_border
 from crp.image import imgify
 
 

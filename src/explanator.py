@@ -31,6 +31,12 @@ def _empty_cuda_cache():
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
+
+def _is_cuda_oom(exc):
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    return "out of memory" in str(exc).lower()
+
 class Explanator:
     """Class that stores all loaded models together with all relevant data for generating CRP explanations.
 
@@ -218,12 +224,38 @@ class Explanator:
                 output_dir_pcx=output_dir_pcx,
                 precision="autocast_fp16" if (self.device == "cuda" and torch.cuda.is_available()) else "fp32",
             )
+        except Exception as exc:
+            if not (_is_cuda_oom(exc) and self.device == "cuda" and torch.cuda.is_available()):
+                raise
+            self.logger.warning("Flood explanation hit CUDA OOM; retrying on CPU: %s", exc)
+            gc.collect()
+            _empty_cuda_cache()
+            cpu_model = self.flood_model.to("cpu")
+            explanation_fig = plot_pcx_explanations_pidnet(
+                model_name,
+                cpu_model,
+                self.flood_dataset,
+                image_tensor=image_tensor.detach().cpu(),
+                layer_name=layer_name,
+                n_concepts=n_concepts,
+                n_refimgs=n_refimgs,
+                num_prototypes=num_prototypes,
+                ref_imgs_path=ref_imgs_path,
+                output_dir_crp=output_dir_crp,
+                output_dir_pcx=output_dir_pcx,
+                device=torch.device("cpu"),
+                precision="fp32",
+            )
+            self._flood_model = cpu_model
             used_n_refimgs = getattr(explanation_fig, "_n_refimgs_used", n_refimgs)
             used_n_concepts = getattr(explanation_fig, "_n_concepts_used", n_concepts)
         finally:
             # Release the input tensor as soon as the attribution run finishes
             del image_tensor
             _empty_cuda_cache()
+
+        used_n_refimgs = getattr(explanation_fig, "_n_refimgs_used", n_refimgs)
+        used_n_concepts = getattr(explanation_fig, "_n_concepts_used", n_concepts)
 
         # fig is returned implicitly as part of this function; adapt if needed
         log_cuda_memory(self.logger, "AFTER EXPLANATION GENERATION")
