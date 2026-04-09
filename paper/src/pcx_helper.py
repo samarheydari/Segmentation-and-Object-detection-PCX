@@ -906,8 +906,6 @@ def export_gmm_view_2d(
     import torchvision.transforms as T
     import torch
 
-    os.makedirs(export_dir, exist_ok=True)
-
     # ---- helper for covariance from GMM ----
     def _cov_from_gmm(gmm_obj, k):
         ct = getattr(gmm_obj, "covariance_type", "full")
@@ -1079,10 +1077,5 @@ def export_gmm_view_2d(
         ax.legend(loc='upper right', fontsize=9, framealpha=0.9)
 
     plt.tight_layout()
-
-    # ---- save figure ----
-    out_path = os.path.join(export_dir, f"gmm_2d_class{class_id}_K{K}.png")
-    fig.savefig(out_path, dpi=dpi, bbox_inches="tight", facecolor='white')
-    print(f"[OK] Saved 2D GMM plot: {out_path}")
 
     return fig
