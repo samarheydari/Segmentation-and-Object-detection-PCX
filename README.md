@@ -46,6 +46,16 @@ python LRP_sanity_check.py --random_input --target_class 1 --y 32 --x 64
 
 This command runs a lightweight sanity test with random input and checks whether relevance is conserved for a single target pixel.
 
+## Final paper results
+
+Two presentation notebooks summarize the saved experiment artifacts without rerunning training:
+
+- [YOLO final results](notebooks/YOLO_final_results.ipynb)
+- [PIDNet final results](notebooks/PIDNet_final_results.ipynb)
+
+They look for `paper/12-supp/code/results` inside the checkout. If the result artifacts live elsewhere, start Jupyter with `PAPER_RESULTS_DIR=/path/to/results`.
+Running either notebook exports its tables, generated plots, and selected figure artifacts under `paper output/yolo` or `paper output/pidnet`.
+
 ## Notes
 
 - Several scripts contain hard-coded or environment-specific paths. You may need to edit them to match your local setup.
