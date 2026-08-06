@@ -39,6 +39,27 @@ PIDNET_METHODS = [
     "Gradient", "activation", "random",
 ]
 
+YOLO_EVERY_EIGHTH_LAYERS = [
+    "module.backbone.stem.rbr_dense.conv",
+    "module.backbone.ERBlock_3.0.rbr_dense.conv",
+    "module.backbone.ERBlock_3.1.block.2.rbr_dense.conv",
+    "module.backbone.ERBlock_4.1.block.1.rbr_dense.conv",
+    "module.backbone.ERBlock_5.0.rbr_dense.conv",
+    "module.backbone.ERBlock_6.1.conv1.rbr_dense.conv",
+    "module.backbone.ERBlock_6.2.cspsppf.cv5.block.conv",
+    "module.neck.Rep_p5.conv1.rbr_dense.conv",
+    "module.neck.reduce_layer1.block.conv",
+    "module.neck.Rep_p4.block.0.rbr_1x1.conv",
+    "module.neck.Bifusion2.cv3.block.conv",
+    "module.neck.Rep_p3.block.2.rbr_dense.conv",
+    "module.neck.Rep_n4.block.1.rbr_1x1.conv",
+    "module.neck.Rep_n5.block.1.rbr_dense.conv",
+    "module.neck.Rep_n6.block.0.rbr_1x1.conv",
+    "module.detect.stems.2.block.conv",
+    "module.detect.reg_convs.2.block.conv",
+    "module.detect.reg_preds.2",
+]
+
 
 def find_repo_root(start: Path | None = None) -> Path:
     """Find the checkout root, whether the notebook runs from root or notebooks/."""
@@ -333,6 +354,75 @@ def plot_pidnet_post_merge(results_root: Path, run: str = "logits", insertion: b
     ax.set_xticklabels(PIDNET_POST_MERGE_LAYERS, rotation=20)
     ax.set_xlim(-0.15, len(PIDNET_POST_MERGE_LAYERS) - 0.85)
     ax.legend(loc="upper left", frameon=True)
+    fig.tight_layout()
+    return fig
+
+
+def plot_yolo_every_eighth(
+    results_root: Path, run: str = "onlycar", class_tag: str = "c1", insertion: bool = False
+):
+    """Reproduce the paper's car-only YOLO plot using every eighth Conv2d layer."""
+    base = results_root / "instance_perturbation" / "person_car" / "yolov6s6" / run
+    data_dir = base / "data" if (base / "data").is_dir() else base
+    suffix = "_insertion.pth" if insertion else ".pth"
+    payloads = {}
+    for layer in YOLO_EVERY_EIGHTH_LAYERS:
+        tagged = data_dir / f"instance_perturbation_{layer}_{class_tag}{suffix}"
+        legacy = data_dir / f"instance_perturbation_{layer}{suffix}"
+        payloads[layer] = _torch_load(tagged if tagged.is_file() else legacy)
+    labels = {
+        "LRP-zplus": "LRP-z+", "LRP-gamma": "LRP-gamma",
+        "LRP-eps": "LRP-eps", "GradCAM": "GradCAM",
+        "Gradient": "gradient", "activation": "activation", "random": "random",
+    }
+    integrate = getattr(np, "trapezoid", None) or np.trapz
+    fig, ax = plt.subplots(figsize=(8, 4), dpi=300)
+    xpos = np.arange(0, len(YOLO_EVERY_EIGHTH_LAYERS) * 8, 8)
+    # Match the original paper script exactly: all layers use the normalized
+    # step widths from the first selected layer.
+    first_steps = np.asarray(payloads[YOLO_EVERY_EIGHTH_LAYERS[0]]["steps"], dtype=float)
+    normalized_steps = first_steps / first_steps[-1]
+    if not insertion:
+        normalized_steps = np.concatenate([[0.0], normalized_steps])
+    step_widths = np.diff(normalized_steps)
+    for index, method in enumerate(PIDNET_METHODS):
+        per_layer = []
+        for layer in YOLO_EVERY_EIGHTH_LAYERS:
+            payload = payloads[layer]
+            values = np.asarray(payload[method], dtype=float)
+            if insertion:
+                values = values - values[0:1]
+            else:
+                values = np.concatenate([np.zeros_like(values[0:1]), values], axis=0)
+            raw_scores = integrate(values, dx=step_widths[:, None], axis=0)
+            nonzero_scores = raw_scores[raw_scores != 0]
+            # The paper calculation removes individual zero samples when a
+            # layer has signal, but retains the complete zero vector for a
+            # layer with no effect. This keeps layers 104--136 in the plot.
+            scores = nonzero_scores if len(nonzero_scores) else raw_scores
+            if not insertion:
+                scores = -scores
+            scores = scores[np.isfinite(scores)]
+            per_layer.append(scores)
+        means = np.asarray([values.mean() for values in per_layer])
+        errors = np.asarray([values.std(ddof=0) / np.sqrt(len(values)) for values in per_layer])
+        combined_error = np.sqrt(np.sum(errors ** 2)) / len(errors)
+        line, = ax.plot(
+            xpos, means, ".-", linewidth=1.5, markersize=5,
+            label=f"{labels[method]} ({means.mean():.4f}+-{combined_error:.4f})",
+            zorder=10 + index,
+        )
+        ax.fill_between(
+            xpos, means - errors, means + errors,
+            color=line.get_color(), alpha=0.2, zorder=index,
+        )
+    metric = "AUC concept insertion" if insertion else "AOC concept flipping"
+    ax.set_title("YOLOv6s6 - person_car (only car)")
+    ax.set_ylabel(metric)
+    ax.set_xlabel("convolutional layer")
+    ax.set_xticks(xpos)
+    ax.set_xticklabels(xpos, rotation=90)
+    ax.legend(loc="upper right", fontsize="small", frameon=True)
     fig.tight_layout()
     return fig
 
