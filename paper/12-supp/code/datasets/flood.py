@@ -25,7 +25,7 @@ def flood_test(**kwargs):
 def _get_data_root():
     # Central path override via environment variable so experiments can be moved
     # across machines without changing code.
-    return os.getenv("FLOOD_DATA_ROOT", "/home/heydari/FHHI-XAI/data/flood_segmentation")
+    return os.getenv("FLOOD_DATA_ROOT", "/home/heydari/paper/Segmentation-and-Object-detection-PCX/flood_segmentation")
 
 
 def _resolve_dataset_root(root: str) -> Path:
