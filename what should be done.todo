@@ -4,3 +4,5 @@ Tasks:
         ☐ make it generate the pcx output samples @critical  
         ☐ make it visualize the results of the paper compltly @high
         ☐ clean up the code and make it more readable @high
+        ☐ delete the "paper/12-supp/code/datasets" @low
+            ☐ delete the "paper/src" @low
