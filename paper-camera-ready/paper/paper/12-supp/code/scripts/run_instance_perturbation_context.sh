@@ -1,0 +1,4 @@
+python3 -m experiments.instance_perturbation_od_context --model_name yolov6 --dataset_name coco2017 --layer_name backbone.ERBlock_5.0.rbr_dense.conv --num_samples 75 --batch_size 10 --class_id 29 --other_class_id 16 --concepts 277,212,343
+python3 -m experiments.instance_perturbation_od_context --model_name yolov6 --dataset_name coco2017 --layer_name backbone.ERBlock_5.0.rbr_dense.conv --num_samples 79 --batch_size 10 --class_id 29 --other_class_id 0 --concepts 271,82,187
+python3 -m experiments.instance_perturbation_od_context --model_name yolov6 --dataset_name coco2017 --layer_name backbone.ERBlock_5.0.rbr_dense.conv --num_samples 131 --batch_size 10 --class_id 37 --other_class_id 0 --concepts 177,478,445
+python3 -m experiments.instance_perturbation_od_context --model_name yolov6 --dataset_name coco2017 --layer_name backbone.ERBlock_5.0.rbr_dense.conv --num_samples 2593 --batch_size 10 --class_id 0 --other_class_id 37 --concepts 177,445,485

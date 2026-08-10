@@ -1,0 +1,57 @@
+# for eval from terminal:  python3 tools/eval.py --cfg configs/general_flood/pidnet_medium_general_flood_trainval.yaml
+# for train from terminal: python3 tools/train.py --cfg configs/general_flood/pidnet_medium_general_flood_trainval.yaml
+CUDNN:
+  BENCHMARK: true
+  DETERMINISTIC: false
+  ENABLED: true
+GPUS: (0,1)
+OUTPUT_DIR: 'output'
+LOG_DIR: 'log'
+WORKERS: 6
+PRINT_FREQ: 10
+
+DATASET:
+  DATASET: General_Flood_v3
+  ROOT: data/
+  TEST_SET: 'list/General_Flood_v3/val.lst'
+  TRAIN_SET: 'list/General_Flood_v3/train.lst'
+  NUM_CLASSES: 2
+MODEL:
+  NAME: pidnet_medium
+  NUM_OUTPUTS: 2
+  PRETRAINED: "pretrained_models/imagenet/PIDNet_M_ImageNet.pth.tar"
+LOSS:
+  USE_OHEM: true
+  OHEMTHRES: 0.9
+  OHEMKEEP: 131072
+  BALANCE_WEIGHTS: [0.4, 1.0]
+  SB_WEIGHTS: 1.0
+TRAIN:
+  IMAGE_SIZE:
+  - 1280
+  - 720
+  BASE_SIZE: 1280
+  BATCH_SIZE_PER_GPU: 6
+  SHUFFLE: true
+  BEGIN_EPOCH: 0
+  END_EPOCH: 200
+  RESUME: false
+  OPTIMIZER: sgd
+  LR: 0.005
+  WD: 0.0005
+  MOMENTUM: 0.9
+  NESTEROV: false
+  FLIP: true
+  MULTI_SCALE: true
+  IGNORE_LABEL: -1
+  SCALE_FACTOR: 16
+TEST:
+  IMAGE_SIZE:
+  - 1280
+  - 720
+  BASE_SIZE: 1280
+  BATCH_SIZE_PER_GPU: 1
+  FLIP_TEST: false
+  MULTI_SCALE: false
+  MODEL_FILE: '/media/FastData/dimpap/PIDNet/output/General_Flood_v3/pidnet_medium_general_flood_trainval/best_medium.pt'
+  OUTPUT_INDEX: 1
