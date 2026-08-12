@@ -67,7 +67,7 @@ def _torch_load_compat(path):
 # @click.option("--layer_name", default="backbone.layer3.0.conv3") #backbone.layer4.0.conv3
 @click.option("--model_name", default="pidnet")
 @click.option("--dataset_name", default="flood")
-@click.option("--layer_name", default="final_layer.conv1")
+@click.option("--layer_name", default="base_model.final_layer.conv1")
 @click.option("--num_samples", default=100)
 @click.option("--batch_size", default=10)
 @click.option("--insertion", default=False, type=bool)
@@ -95,8 +95,7 @@ def main(model_name, dataset_name, layer_name, num_samples, batch_size, insertio
     _, test_dataset, n_classes = get_dataset(dataset_name=dataset_name).values()
     dataset_kwargs = {}
     if dataset_name == "flood" and model_name == "pidnet":
-        # Match the paper/canonizer geometry: 720x1280 input -> 90x160 logits.
-        dataset_kwargs["resize_hw"] = (720, 1280)
+        dataset_kwargs["resize_hw"] = (384, 512)
         dataset_kwargs["mask_downsample"] = 8
     dataset = test_dataset(**dataset_kwargs)
 
@@ -108,11 +107,6 @@ def main(model_name, dataset_name, layer_name, num_samples, batch_size, insertio
 
     model = get_model(model_name=model_name, **model_kwargs)
     model_masked = get_model(model_name=model_name, **model_kwargs)
-    if model_name == "pidnet":
-        # Match the paper pipeline exactly: canonize and hook the native PIDNet,
-        # rather than an adapter wrapper that changes the visible module graph.
-        model = model.base_model
-        model_masked = model_masked.base_model
     model = model.to(device)
     model_masked = model_masked.to(device)
     model.eval()

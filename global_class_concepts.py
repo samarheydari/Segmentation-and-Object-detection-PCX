@@ -30,10 +30,10 @@ from LCRP.utils.zennit_composites import EpsilonPlusFlat, EpsilonGammaFlat, Epsi
 @click.command()
 @click.option("--model_name", default="pidnet")
 @click.option("--dataset_name", default="flood")
-@click.option("--class_id", default=0)
+@click.option("--class_id", default=1)
 @click.option("--batch_size", default=1, show_default=True,
               help="Attribution batch size. PIDNet at 720x1280 typically requires 1 on a 24 GB GPU.")
-@click.option("--rel_init", default="ones", help="[ones, prob, logits]")
+@click.option("--rel_init", default="logits", show_default=True, help="[ones, prob, logits]")
 @click.option(
     "--checkpoint_path",
     default=os.path.join(project_root, "LCRP/models/flood_model.pt"),
@@ -52,8 +52,7 @@ def main(model_name, dataset_name, class_id, batch_size, rel_init, checkpoint_pa
     _, test_dataset, n_classes = get_dataset(dataset_name=dataset_name).values()
     dataset_kwargs = {}
     if dataset_name == "flood" and model_name == "pidnet":
-        # Match the canonizer geometry: 720x1280 input -> 90x160 logits.
-        dataset_kwargs["resize_hw"] = (720, 1280)
+        dataset_kwargs["resize_hw"] = (384, 512)
         dataset_kwargs["mask_downsample"] = 8
     dataset = test_dataset(**dataset_kwargs)
 
@@ -63,8 +62,6 @@ def main(model_name, dataset_name, class_id, batch_size, rel_init, checkpoint_pa
         print(f"Loading PIDNet checkpoint: {checkpoint_path}")
         model_kwargs["ckpt_path"] = checkpoint_path
     model = get_model(model_name=model_name, **model_kwargs)
-    if model_name == "pidnet":
-        model = model.base_model
     model = model.to(device)
     model.eval()
 
@@ -78,13 +75,12 @@ def main(model_name, dataset_name, class_id, batch_size, rel_init, checkpoint_pa
     condition = [{"y": class_id}]
     layer_names = get_layer_names(model, [torch.nn.Conv2d])
     if model_name == "pidnet" and dataset_name == "flood":
-        # every PIDNet convolution at 720x1280 exceeds a 24 GB GPU even for
-        # batch size 1, while restricting hooks does not alter these tensors.
+        # Record only the layers consumed by the paper perturbation figure.
         Post_merge_layers = [
-            "dfm.conv_p.0",
-            "dfm.conv_i.0",
-            "final_layer.conv1",
-            "final_layer.conv2",
+            "base_model.dfm.conv_p.0",
+            "base_model.dfm.conv_i.0",
+            "base_model.final_layer.conv1",
+            "base_model.final_layer.conv2",
         ]
         missing_layers = [layer for layer in Post_merge_layers if layer not in layer_names]
         if missing_layers:

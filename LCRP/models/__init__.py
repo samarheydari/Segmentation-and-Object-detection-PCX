@@ -13,7 +13,7 @@ def _load_callable(module_path: str, attr_name: str):
 
 
 def _get_smp_unet(**kwargs):
-    get_smp = _load_callable("models.smp", "get_smp")
+    get_smp = _load_callable("LCRP.models.smp", "get_smp")
     return get_smp("unet")(**kwargs)
 
 
@@ -60,7 +60,7 @@ def _get_pidnet_for_perturbation(**kwargs):
     - If caller passed `ckpt_path`, keep it.
     - Otherwise pull from `PIDNET_CKPT_PATH` environment variable.
     """
-    get_pidnet = _load_callable("models.pidnet", "get_pidnet")
+    get_pidnet = _load_callable("LCRP.models.pidnet", "get_pidnet")
 
     # We intentionally bypass strict internal checkpoint loading from models/pidnet.py:
     # build architecture first, then load checkpoint here with flexible key handling.
@@ -97,12 +97,12 @@ def _get_pidnet_for_perturbation(**kwargs):
 
 MODELS = {
     # object detectors
-    "yolov5": ("models.yolov5", "get_yolov5"),
-    "yolov6": ("models.yolov6", "get_yolov6"),
-    "yolov6s6": ("models.yolov6", "get_yolov6s6"),
+    "yolov5": ("LCRP.models.yolov5", "get_yolov5"),
+    "yolov6": ("LCRP.models.yolov6", "get_yolov6"),
+    "yolov6s6": ("LCRP.models.yolov6", "get_yolov6s6"),
     # segmentation models
     "unet": _get_smp_unet,
-    "deeplabv3plus": ("models.deeplabv3plus", "get_deeplabv3plus"),
+    "deeplabv3plus": ("LCRP.models.deeplabv3plus", "get_deeplabv3plus"),
     # Intentionally use adapter for experiment compatibility while keeping PIDNet logic unchanged.
     "pidnet": _get_pidnet_for_perturbation,
 }
