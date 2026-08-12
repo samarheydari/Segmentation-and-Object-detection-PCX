@@ -31,9 +31,17 @@ from LCRP.utils.zennit_composites import EpsilonPlusFlat, EpsilonGammaFlat, Epsi
 @click.option("--model_name", default="pidnet")
 @click.option("--dataset_name", default="flood")
 @click.option("--class_id", default=0)
-@click.option("--batch_size", default=5)
+@click.option("--batch_size", default=1, show_default=True,
+              help="Attribution batch size. PIDNet at 720x1280 typically requires 1 on a 24 GB GPU.")
 @click.option("--rel_init", default="ones", help="[ones, prob, logits]")
-def main(model_name, dataset_name, class_id, batch_size, rel_init):
+@click.option(
+    "--checkpoint_path",
+    default=os.path.join(project_root, "LCRP/models/flood_model.pt"),
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    show_default=True,
+    help="PIDNet checkpoint used to generate the concept vectors.",
+)
+def main(model_name, dataset_name, class_id, batch_size, rel_init, checkpoint_path):
     model_aliases = {
         "YOLOv6s": "yolov6s6",
         "yolov6s": "yolov6s6",
@@ -44,11 +52,19 @@ def main(model_name, dataset_name, class_id, batch_size, rel_init):
     _, test_dataset, n_classes = get_dataset(dataset_name=dataset_name).values()
     dataset_kwargs = {}
     if dataset_name == "flood" and model_name == "pidnet":
-        # Keep class filtering consistent with PIDNet logits scale.
+        # Match the canonizer geometry: 720x1280 input -> 90x160 logits.
+        dataset_kwargs["resize_hw"] = (720, 1280)
         dataset_kwargs["mask_downsample"] = 8
     dataset = test_dataset(**dataset_kwargs)
 
-    model = get_model(model_name=model_name, classes=n_classes)
+    model_kwargs = {"classes": n_classes}
+    if model_name == "pidnet":
+        checkpoint_path = os.path.abspath(checkpoint_path)
+        print(f"Loading PIDNet checkpoint: {checkpoint_path}")
+        model_kwargs["ckpt_path"] = checkpoint_path
+    model = get_model(model_name=model_name, **model_kwargs)
+    if model_name == "pidnet":
+        model = model.base_model
     model = model.to(device)
     model.eval()
 
@@ -61,6 +77,20 @@ def main(model_name, dataset_name, class_id, batch_size, rel_init):
     cc = ChannelConcept()
     condition = [{"y": class_id}]
     layer_names = get_layer_names(model, [torch.nn.Conv2d])
+    if model_name == "pidnet" and dataset_name == "flood":
+        # every PIDNet convolution at 720x1280 exceeds a 24 GB GPU even for
+        # batch size 1, while restricting hooks does not alter these tensors.
+        Post_merge_layers = [
+            "dfm.conv_p.0",
+            "dfm.conv_i.0",
+            "final_layer.conv1",
+            "final_layer.conv2",
+        ]
+        missing_layers = [layer for layer in Post_merge_layers if layer not in layer_names]
+        if missing_layers:
+            raise RuntimeError(f"PIDNet paper layers not found: {missing_layers}")
+        layer_names = Post_merge_layers
+        print("Recording only PIDNet paper layers:", layer_names)
 
     layer_map = {layer: cc for layer in layer_names}
     fv = VISUALIZATIONS[model_name](attribution,
@@ -111,7 +141,8 @@ def main(model_name, dataset_name, class_id, batch_size, rel_init):
         non_zero = (attr_zplus.heatmap.sum((1, 2)).abs() > 0).detach().cpu().numpy()
         samples_nz = samples_batch[non_zero]
         if samples_nz.size:
-            smpls += [s for s in samples_nz]
+            # Store portable Python integers rather than NumPy scalar objects.
+            smpls += [int(s) for s in samples_nz]
             rels_zplus = [cc.attribute(attr_zplus.relevances[layer][non_zero], abs_norm=True) for layer in active_layers]
             rels_gamma = [cc.attribute(attr_gamma.relevances[layer][non_zero], abs_norm=True) for layer in active_layers]
             rels_eps = [cc.attribute(attr_eps.relevances[layer][non_zero], abs_norm=True) for layer in active_layers]
@@ -131,7 +162,13 @@ def main(model_name, dataset_name, class_id, batch_size, rel_init):
                 crvs_grad[l] += grad.detach().cpu()
                 crvs_gradcam[l] += gradc.detach().cpu()
 
-    path = f"results/global_class_concepts/{dataset_name}_onlyflood/{model_name}/{rel_init}"
+        # Attribution results retain large autograd graphs and recorded feature
+        # maps. Release them before processing the next 720x1280 batch.
+        del attr_zplus, attr_gamma, attr_eps, attr_grad, data
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    path = os.path.join(project_root, "results/global_class_concepts", dataset_name, model_name, rel_init)
     os.makedirs(path, exist_ok=True)
     torch.save({"samples": smpls,
                 "crvs_zplus": crvs_zplus,

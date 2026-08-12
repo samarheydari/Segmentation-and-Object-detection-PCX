@@ -2,6 +2,7 @@ import os
 import random
 import os
 import sys
+import importlib
 
 # Allow running this file directly from IDE "Run" button.
 # When executed as a script, Python's import root is this file's folder
@@ -35,6 +36,28 @@ from LCRP.utils.zennit_composites import EpsilonPlusFlat
 random.seed(10)
 
 
+def _torch_load_compat(path):
+    """Load tensors saved by either NumPy 1.x or 2.x environments."""
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except ModuleNotFoundError as exc:
+        if not (exc.name or "").startswith("numpy._core"):
+            raise
+        aliases = {
+            "numpy._core": "numpy.core",
+            "numpy._core.multiarray": "numpy.core.multiarray",
+            "numpy._core.numeric": "numpy.core.numeric",
+            "numpy._core.umath": "numpy.core.umath",
+            "numpy._core._multiarray_umath": "numpy.core._multiarray_umath",
+        }
+        for new_name, old_name in aliases.items():
+            try:
+                sys.modules.setdefault(new_name, importlib.import_module(old_name))
+            except ModuleNotFoundError:
+                pass
+        return torch.load(path, map_location="cpu", weights_only=False)
+
+
 @click.command()
 # @click.option("--model_name", default="unet")
 # @click.option("--dataset_name", default="cityscapes")
@@ -44,7 +67,7 @@ random.seed(10)
 # @click.option("--layer_name", default="backbone.layer3.0.conv3") #backbone.layer4.0.conv3
 @click.option("--model_name", default="pidnet")
 @click.option("--dataset_name", default="flood")
-@click.option("--layer_name", default="base_model.final_layer.conv1") #base_model.final_layer.conv1
+@click.option("--layer_name", default="final_layer.conv1")
 @click.option("--num_samples", default=100)
 @click.option("--batch_size", default=10)
 @click.option("--insertion", default=False, type=bool)
@@ -53,21 +76,43 @@ random.seed(10)
 @click.option("--balanced_sampling", default=True, type=bool, help="Sample target classes uniformly.")
 @click.option("--min_mask_area", default=64, type=int, help="Minimum mask area in pixels; smaller masks contribute 0.")
 @click.option("--seed", default=10, type=int, help="Random seed for reproducibility.")
+@click.option(
+    "--checkpoint_path",
+    default=os.path.join(project_root, "LCRP/models/flood_model.pt"),
+    type=click.Path(exists=True, dir_okay=False, path_type=str),
+    show_default=True,
+    help="PIDNet checkpoint. The same weights are loaded into both models.",
+)
 def main(model_name, dataset_name, layer_name, num_samples, batch_size, insertion, rel_init,
-         num_steps, balanced_sampling, min_mask_area, seed):
+         num_steps, balanced_sampling, min_mask_area, seed, checkpoint_path):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _, test_dataset, n_classes = get_dataset(dataset_name=dataset_name).values()
-    # Keep masks at their native resolution. The current PIDNet wrapper may
-    # return full-resolution logits, while other variants return 1/8-scale
-    # logits; masks are aligned to the actual output below.
-    dataset = test_dataset()
+    dataset_kwargs = {}
+    if dataset_name == "flood" and model_name == "pidnet":
+        # Match the paper/canonizer geometry: 720x1280 input -> 90x160 logits.
+        dataset_kwargs["resize_hw"] = (720, 1280)
+        dataset_kwargs["mask_downsample"] = 8
+    dataset = test_dataset(**dataset_kwargs)
 
-    model = get_model(model_name=model_name, classes=n_classes)
-    model_masked = get_model(model_name=model_name, classes=n_classes)
+    model_kwargs = {"classes": n_classes}
+    if model_name == "pidnet":
+        checkpoint_path = os.path.abspath(checkpoint_path)
+        print(f"Loading PIDNet checkpoint into both models: {checkpoint_path}")
+        model_kwargs["ckpt_path"] = checkpoint_path
+
+    model = get_model(model_name=model_name, **model_kwargs)
+    model_masked = get_model(model_name=model_name, **model_kwargs)
+    if model_name == "pidnet":
+        # Match the paper pipeline exactly: canonize and hook the native PIDNet,
+        # rather than an adapter wrapper that changes the visible module graph.
+        model = model.base_model
+        model_masked = model_masked.base_model
     model = model.to(device)
     model_masked = model_masked.to(device)
     model.eval()
@@ -108,10 +153,9 @@ def main(model_name, dataset_name, layer_name, num_samples, batch_size, insertio
     classes_unique = []
     for c in np.arange(0, n_classes):
         try:
-            data = torch.load(
-                f"/home/heydari/paper/Segmentation-and-Object-detection-PCX/results/global_class_concepts/{dataset_name}/{model_name}/{rel_init}/{layer_name}_class_{c}.pth",
-                map_location="cpu",
-                weights_only=False,
+            data = _torch_load_compat(
+                os.path.join(project_root, "results/global_class_concepts", dataset_name,
+                             model_name, rel_init, f"{layer_name}_class_{c}.pth")
             )
             for exp in experiments:
                 if exp["label"] != "random":
