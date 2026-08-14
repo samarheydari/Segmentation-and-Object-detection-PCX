@@ -6,3 +6,4 @@ paper_sanity_check/src/__pycache__/
 paper_sanity_check/src/datasets/__pycache__/
 *.pth
 results/
+output/
