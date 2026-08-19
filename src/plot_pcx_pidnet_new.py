@@ -5,6 +5,7 @@ import time
 import h5py
 import copy
 import logging
+from contextlib import contextmanager
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -25,6 +26,7 @@ import zennit.image as zimage
 from crp.concepts import ChannelConcept
 from crp.helper import get_layer_names
 from crp.image import imgify
+from zennit.core import Composite
 from LCRP.utils.crp_configs import ATTRIBUTORS, CANONIZERS, VISUALIZATIONS, COMPOSITES
 from LCRP.utils.render import vis_opaque_img_border
 #from src.pcx_helper import plot_gmm_umap_2d, plot_gmm_umap_3d, plot_prototype_n_nearest
@@ -34,6 +36,19 @@ logging.disable(logging.ERROR)
 # -------------------------
 # Small helpers
 # -------------------------
+@contextmanager
+def _dynamic_layer_composite(model, composite, layer_name):
+    """Expose PIDNet's canonized sequential head before CRP installs hooks."""
+    pre_registered = layer_name not in dict(model.named_modules())
+    if pre_registered:
+        composite.register(model)
+    try:
+        yield Composite() if pre_registered else composite
+    finally:
+        if pre_registered:
+            composite.remove()
+
+
 def _as_uint8_array(image: Image.Image) -> np.ndarray:
     arr = np.array(image)
     if arr.dtype != np.uint8:
@@ -218,7 +233,8 @@ def plot_one_image_pcx_explanation(
     # Attribution on the chosen sample
     print("[attr] computing base attribution")
     x_copy = copy.deepcopy(x).requires_grad_()
-    attr = attribution(x_copy, condition, composite, record_layer=[layer], init_rel=1)
+    with _dynamic_layer_composite(model, composite, layer) as active_composite:
+        attr = attribution(x_copy, condition, active_composite, record_layer=[layer], init_rel=1)
 
     # Heatmap
     heatmap_pil = zimage.imgify(attr.heatmap.detach().cpu(), cmap="bwr", symmetric=True, level=10)
@@ -253,6 +269,14 @@ def plot_one_image_pcx_explanation(
     print(f"[concepts] channel_rels shape={tuple(channel_rels.shape)}")
 
     # Top-k concepts
+    available_concepts = int(channel_rels_vec.numel())
+    requested_concepts = int(n_concepts)
+    n_concepts = min(requested_concepts, available_concepts)
+    if n_concepts < requested_concepts:
+        print(
+            f"[concepts] requested {requested_concepts}, but layer '{layer}' has only "
+            f"{available_concepts} channels; plotting {n_concepts}."
+        )
     topk = torch.topk(channel_rels_vec, k=n_concepts)
     topk_ind = topk.indices.detach().cpu().numpy()
     topk_rel = topk.values.detach().cpu().numpy()
@@ -262,15 +286,19 @@ def plot_one_image_pcx_explanation(
     conditions = [{"y": 1, layer: int(c)} for c in topk_ind]
     print("[attr] computing conditional heatmaps")
     attribution.take_prediction = 0
-    cond_heatmaps, _, _, _ = attribution(x.requires_grad_(), conditions, composite, exclude_parallel=True)
+    with _dynamic_layer_composite(model, composite, layer) as active_composite:
+        cond_heatmaps, _, _, _ = attribution(
+            x.requires_grad_(), conditions, active_composite, exclude_parallel=True
+        )
     attribution.take_prediction = 0
 
     # Reference images
     print("[refs] computing/loading reference images")
-    ref_imgs = get_ref_images(
-        fv=fv, topk_ind=topk_ind, layer_name=layer,
-        composite=composite, n_ref=n_refimgs, ref_imgs_save_path=ref_imgs_path
-    )
+    with _dynamic_layer_composite(model, composite, layer) as active_composite:
+        ref_imgs = get_ref_images(
+            fv=fv, topk_ind=topk_ind, layer_name=layer,
+            composite=active_composite, n_ref=n_refimgs, ref_imgs_save_path=ref_imgs_path
+        )
 
     # Load attributions matrix for GMM
     attr_path = os.path.join(output_dir_pcx, layer, "attributions.npy")
@@ -346,8 +374,14 @@ def plot_one_image_pcx_explanation(
     data_p, _ = dataset[closest_idx]
     data_p = data_p.to(device)[None]
     print("[proto] computing prototype attributions")
-    attr_p = attribution(data_p.requires_grad_(), [{"y": 1}], composite, record_layer=[layer])
-    cond_heatmap_p, _, _, _ = attribution(data_p.requires_grad_(), conditions, composite)
+    with _dynamic_layer_composite(model, composite, layer) as active_composite:
+        attr_p = attribution(
+            data_p.requires_grad_(), [{"y": 1}], active_composite, record_layer=[layer]
+        )
+    with _dynamic_layer_composite(model, composite, layer) as active_composite:
+        cond_heatmap_p, _, _, _ = attribution(
+            data_p.requires_grad_(), conditions, active_composite
+        )
     proto_heatmap_pil = zimage.imgify(attr_p.heatmap, cmap="bwr", symmetric=True, level=10)
 
     # Prototype mask
@@ -370,7 +404,9 @@ def plot_one_image_pcx_explanation(
     # Plotting
     # -------------------------
     print("[plot] assembling figure")
-    n_rows = max(n_concepts, 4)
+    # Three rows are sufficient for the input/heatmap/likelihood summary in
+    # column zero. Extra rows are needed only when a layer has more concepts.
+    n_rows = max(n_concepts, 3)
     width_ratios = [1, 1, n_refimgs / 4 if n_refimgs else 1, 1, 1, 1]
 
     fig, axs = plt.subplots(

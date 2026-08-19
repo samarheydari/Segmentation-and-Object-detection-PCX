@@ -16,6 +16,7 @@ import zennit.image as zimage
 from crp.concepts import ChannelConcept
 from crp.helper import get_layer_names
 from crp.image import imgify
+from zennit.core import Composite
 
 logger = logging.getLogger(__name__)
 
@@ -224,16 +225,30 @@ def _run_attr_cpu(model, attribution_cls, composite, img_or_batch, *,
         x_cpu = img_or_batch.detach().cpu().requires_grad_(True)
         rec = [] if record_layer is None else list(record_layer)  # never pass None
 
-        if conditions is not None:
+        # PIDNet's canonizer creates final_layer.sequential.* dynamically. CRP
+        # installs recording/condition hooks before entering a passed composite,
+        # so those names cannot be found unless canonization happens first.
+        missing_before_canonization = [name for name in rec if name not in dict(model.named_modules())]
+        pre_registered = bool(missing_before_canonization)
+        if pre_registered:
+            composite.register(model)
+
+        try:
+            # When pre-registered, its canonizer and LRP-rule hooks are already
+            # active. An empty composite prevents registering the same hooks twice.
+            active_composite = Composite() if pre_registered else composite
+            if conditions is not None:
+                return attribution_cpu(
+                    x_cpu, conditions, active_composite,
+                    record_layer=rec, init_rel=init_rel, exclude_parallel=exclude_parallel
+                )
             return attribution_cpu(
-                x_cpu, conditions, composite,
-                record_layer=rec, init_rel=init_rel, exclude_parallel=exclude_parallel
-            )
-        else:
-            return attribution_cpu(
-                x_cpu, condition, composite,
+                x_cpu, condition, active_composite,
                 record_layer=rec, init_rel=init_rel
             )
+        finally:
+            if pre_registered:
+                composite.remove()
 
     return _with_model_on_cpu(model, _do)
 
@@ -414,6 +429,20 @@ def plot_one_image_explanation_optimized(model_name, model, img, dataset, class_
         channel_rels = channel_rels / channel_rels.abs().sum(1)[:, None]
 
     # === Top concepts ===
+    available_concepts = int(channel_rels.shape[1])
+    requested_concepts = int(n_concepts)
+    n_concepts = min(requested_concepts, available_concepts)
+    if n_concepts < requested_concepts:
+        print(
+            f"Requested {requested_concepts} concepts, but layer '{layer}' has only "
+            f"{available_concepts} channels; plotting {n_concepts}."
+        )
+        # The figure was allocated before attribution revealed the channel
+        # count. Hide the unused rows and shrink away their empty space.
+        for unused_row in range(n_concepts + 1, total_rows):
+            for ax in axs[unused_row]:
+                ax.remove()
+        fig.set_size_inches(fig_width, 2.1 * (n_concepts + 1), forward=True)
     topk = torch.topk(channel_rels[0], n_concepts)
     topk_ind = topk.indices.detach().cpu().numpy()
     topk_rel = topk.values.detach().cpu().numpy()
@@ -446,17 +475,25 @@ def plot_one_image_explanation_optimized(model_name, model, img, dataset, class_
     ref_images_start_ts = time.time()
 
     def _get_refs_cpu():
-        # Build a CPU attribution and FV object bound to CPU
-        attribution_cpu = ATTRIBUTORS[model_name](model)
-        fv_cpu = VISUALIZATIONS[model_name](
-            attribution_cpu, dataset, get_layer_names(model, [torch.nn.Conv2d]),
-            preprocess_fn=lambda x: x, path=output_dir, max_target="max", device="cpu"
-        )
-        # Call get_max_reference on CPU
-        return fv_cpu.get_max_reference(
-            topk_ind, layer, mode, (0, n_refimgs), composite=composite, rf=True,
-            plot_fn=vis_opaque_img_border, batch_size=2
-        )
+        # Canonization must precede conditional-hook registration for dynamic
+        # PIDNet final_layer.sequential.* names, just as in _run_attr_cpu.
+        pre_registered = layer not in dict(model.named_modules())
+        if pre_registered:
+            composite.register(model)
+        try:
+            attribution_cpu = ATTRIBUTORS[model_name](model)
+            fv_cpu = VISUALIZATIONS[model_name](
+                attribution_cpu, dataset, get_layer_names(model, [torch.nn.Conv2d]),
+                preprocess_fn=lambda x: x, path=output_dir, max_target="max", device="cpu"
+            )
+            active_composite = Composite() if pre_registered else composite
+            return fv_cpu.get_max_reference(
+                topk_ind, layer, mode, (0, n_refimgs), composite=active_composite, rf=True,
+                plot_fn=vis_opaque_img_border, batch_size=2
+            )
+        finally:
+            if pre_registered:
+                composite.remove()
 
     ref_imgs = _with_model_on_cpu(model, _get_refs_cpu)
 
@@ -468,7 +505,9 @@ def plot_one_image_explanation_optimized(model_name, model, img, dataset, class_
     print("Plotting...")
     resize = torchvision.transforms.Resize((150, 150))
 
-    for r in range(total_rows):
+    # Row zero is the input; the remaining rows correspond one-to-one to the
+    # concepts actually returned by topk (not the originally requested count).
+    for r in range(n_concepts + 1):
         row_axs = axs[r]
         log_memory(f"PLOTTING CONCEPT {r}")
 
